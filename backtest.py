@@ -1,217 +1,462 @@
 import ccxt
 import pandas as pd
-import pandas_ta as ta # 引入 pandas-ta 库
+import pandas_ta as ta # Import pandas-ta library
 import os
+import traceback
 import numpy as np
+import time
+import hashlib
 
 from dotenv import load_dotenv
 
 
-def fetch_historical_data(symbol, timeframe, limit):
+def fetch_historical_data(symbol, timeframe, from_datetime=None, limit=None, use_cache=True):
     """
-    从币安拉取历史K线数据并转换为Pandas DataFrame
+    Fetch historical K-line data from Binance and convert to Pandas DataFrame
+    
+    Parameters:
+    symbol (str): Trading pair, e.g. 'BTC/USDT'
+    timeframe (str): Time frame, e.g. '1m', '1h', '1d'
+    from_datetime (str): Start time, format like '2024-01-01 00:00:00', if None then use limit parameter
+    limit (int): If from_datetime is None, fetch the latest limit K-lines
+    use_cache (bool): Whether to use cache, default True
     """
     
-    # --- 1. 初始化 CCXT 交易所 ---
-    # 我们甚至不需要API Key来拉取公共的K线数据
-    # 但为了后续交易，我们保持标准写法
+    # --- 0. Cache handling ---
+    if use_cache:
+        # Create cache directory
+        cache_dir = ".cache"
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+        
+        # Generate cache filename (based on parameter hash)
+        cache_params = f"{symbol}_{timeframe}_{from_datetime}_{limit}"
+        cache_hash = hashlib.md5(cache_params.encode()).hexdigest()
+        cache_file = os.path.join(cache_dir, f"data_{cache_hash}.csv")
+        
+        # Check if cache file exists
+        if os.path.exists(cache_file):
+            try:
+                print(f"[Cache] Loading data from cache: {cache_file}")
+                df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                print(f"[Cache] Successfully loaded {len(df)} K-line data from cache.")
+                print(f"[Cache] Data time range: {df.index[0]} to {df.index[-1]}")
+                return df
+            except Exception as e:
+                print(f"[Cache] Cache file corrupted, will re-download data: {e}")
     
-    load_dotenv() # 如果只是拉取公开数据，可以暂时不加载key
+    # --- 1. Initialize CCXT exchange ---
+    load_dotenv() # Load .env variables
     apiKey = os.environ.get('BINANCE_API_KEY')
     secret = os.environ.get('BINANCE_SECRET_KEY')
     
     exchange = ccxt.binance({
-        'enableRateLimit': True, # 自动处理速率限制
+        'enableRateLimit': True, # Auto handle rate limiting
         'apiKey': apiKey,
         'secret': secret
     })
     
-    # (可选) 如果您在测试网操作，需要设置
+    # (Optional) If operating on testnet, need to set this
     exchange.set_sandbox_mode(True) 
     
-    print(f"正在拉取 {symbol} 的 {timeframe} 数据，最近 {limit} 根K线...")
+    # Time interval constants (milliseconds)
+    timeframe_to_ms = {
+        '1m': 60 * 1000,
+        '5m': 5 * 60 * 1000,
+        '15m': 15 * 60 * 1000,
+        '30m': 30 * 60 * 1000,
+        '1h': 60 * 60 * 1000,
+        '4h': 4 * 60 * 60 * 1000,
+        '1d': 24 * 60 * 60 * 1000
+    }
+    
+    if from_datetime:
+        # Paged fetch mode: from specified time to now
+        print(f"[Fetch] Fetching {symbol} {timeframe} data in pages, from {from_datetime} to now...")
+        
+        from_timestamp = exchange.parse8601(from_datetime)
+        now = exchange.milliseconds()
+        all_ohlcv = []
+        
+        while from_timestamp < now:
+            print(f'[Fetch] Pulling ohlcv beginning at: {exchange.iso8601(from_timestamp)}')
+            
+            try:
+                ohlcvs = exchange.fetch_ohlcv(symbol, timeframe, from_timestamp)
+                
+                if not ohlcvs:
+                    break
+                    
+                # Filter out duplicate data (Binance sometimes returns the last bar)
+                if all_ohlcv and ohlcvs[0][0] == all_ohlcv[-1][0]:
+                    ohlcvs = ohlcvs[1:]
+                    
+                if not ohlcvs:
+                    break
+
+                all_ohlcv.extend(ohlcvs)
+                
+                # Update next request start time
+                from_timestamp = ohlcvs[-1][0] + timeframe_to_ms.get(timeframe, 60 * 1000)
+                
+                # Avoid triggering rate limits
+                if exchange.rateLimit:
+                    time.sleep(exchange.rateLimit / 1000)
+                    
+            except Exception as e:
+                print(f"[Fetch] Error occurred while fetching data: {e}")
+                break
+        
+        ohlcv = all_ohlcv
+        
+    else:
+        # Traditional mode: fetch the latest limit K-lines
+        if limit is None:
+            limit = 1000
+        print(f"[Fetch] Fetching {symbol} {timeframe} data, latest {limit} K-lines...")
+        
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        except Exception as e:
+            print(f"[Fetch] Error occurred while fetching data: {e}")
+            return None
+    
+    if not ohlcv:
+        print("[Fetch] No data fetched.")
+        return None
 
     try:
-        # --- 2. 拉取数据 ---
-        # ccxt 返回的是一个列表的列表 [timestamp, open, high, low, close, volume]
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        
-        if not ohlcv:
-            print("没有拉取到数据。")
-            return None
-
-        # --- 3. 转换为 Pandas DataFrame ---
+        # --- Convert to Pandas DataFrame ---
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # 将 timestamp 转换为易读的 datetime 格式
+        # Convert timestamp to readable datetime format
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # 将 timestamp 设置为索引 (这对于时间序列分析是标准做法)
+        # Remove potential duplicates
+        df.drop_duplicates(subset='timestamp', inplace=True)
+
+        # Set timestamp as index (this is standard practice for time series analysis)
         df.set_index('timestamp', inplace=True)
         
-        # 转换数据类型为 float，因为TA计算需要
+        # Convert data types to float, as TA calculations require it
         df = df.astype(float)
         
-        print(f"成功拉取 {len(df)} 根K线数据。")
+        print(f"[Fetch] Successfully fetched {len(df)} K-line data.")
+        print(f"[Fetch] Data time range: {df.index[0]} to {df.index[-1]}")
+        
+        # --- Save to cache ---
+        if use_cache:
+            try:
+                df.to_csv(cache_file)
+                print(f"[Cache] Data saved to cache: {cache_file}")
+            except Exception as e:
+                print(f"[Cache] Error occurred while saving cache: {e}")
+        
         return df
 
-    except ccxt.NetworkError as e:
-        print(f"网络错误: {e}")
-    except ccxt.ExchangeError as e:
-        print(f"交易所错误: {e}")
     except Exception as e:
-        print(f"发生未知错误: {e}")
+        print(f"Unknown error occurred: {traceback.format_exc()}")
     
     return None
 
-def calculate_indicators(df):
+# --- [Function 2: calculate_signals (Unchanged from previous)] ---
+def calculate_signals(df, rsi_length=14, rsi_col_name='RSI_14', ema_short_len=10, ema_long_len=30):
     """
-    在DataFrame上计算技术指标 (EMA 10 和 30)
-    """
-    if df is None:
-        return None
-        
-    print("正在计算技术指标 (EMA 10, EMA 30)...")
-    
-    # --- 4. 计算指标 ---
-    # 使用 pandas-ta，我们直接在df上调用 .ta.ema()
-    # `append=True` 会自动将新列 (如 'EMA_10') 添加回原始的df中
-    
-    # 计算快速EMA
-    df.ta.ema(length=10, append=True)
-    
-    # 计算慢速EMA
-    df.ta.ema(length=30, append=True)
-    
-    # pandas-ta 默认的列名是 'EMA_10' 和 'EMA_30'
-    # 我们可以重命名它们以便更清晰 (可选)
-    # df.rename(columns={'EMA_10': 'ema_fast', 'EMA_30': 'ema_slow'}, inplace=True)
-    
-    print("指标计算完成。")
-    return df
-
-
-# --- [新增] 任务 3.3: 开发回测引擎 (向量化) ---
-def run_backtest(df):
-    """
-    执行向量化回测，生成信号和持仓
+    Calculates indicators for both Long (EMA) and Short (RSI) strategies.
+    The trend indicator is assumed to be already present.
     """
     if df is None: return None
-    print("正在执行向量化回测...")
+    print(f"[Signal] Calculating indicators (RSI {rsi_length}, EMA {ema_short_len}/{ema_long_len})...")
     
-    # --- 步骤 1: 定义信号 (金叉/死叉) ---
+    # 1. Calculate RSI indicator (for Short strategy)
+    df[rsi_col_name] = df.ta.rsi(length=rsi_length)
     
-    # 金叉 (买入信号): 快速线上穿慢速线
-    buy_signal = (df['EMA_10'] > df['EMA_30']) & (df['EMA_10'].shift(1) <= df['EMA_30'].shift(1))
+    # 2. Calculate EMA indicators (for Long strategy)
+    ema_short_col = f'EMA_{ema_short_len}'
+    ema_long_col = f'EMA_{ema_long_len}'
+    df[ema_short_col] = df.ta.ema(length=ema_short_len)
+    df[ema_long_col] = df.ta.ema(length=ema_long_len)
     
-    # 死叉 (卖出信号): 快速线下穿慢速线
-    sell_signal = (df['EMA_10'] < df['EMA_30']) & (df['EMA_10'].shift(1) >= df['EMA_30'].shift(1))
+    # 3. Pre-calculate Long entry signal (Golden Cross)
+    df['buy_signal'] = (df[ema_short_col] > df[ema_long_col]) & (df[ema_short_col].shift(1) <= df[ema_long_col].shift(1))
     
-    # --- 步骤 2: 模拟持仓 (Position) ---
+    # 4. Drop rows with initial NaN values
+    #    (This will drop NaNs from RSI, EMAs, and the merged TREND_EMA)
+    df.dropna(inplace=True) 
     
-    # *** 错误修正 ***
-    # 修正前 (错误): conditions = [(buy_signal, 1), (sell_signal, 0)]
-    #                df['position'] = np.select(conditions, [1, 0], default=np.nan)
-    
-    # 修正后 (正确):
-    # condlist 是一个纯粹的条件(bool)列表
-    condlist = [buy_signal, sell_signal]
-    
-    # choicelist 是一个对应的结果值列表
-    choicelist = [1, 0]
-    
-    # np.select 会按顺序检查condlist：
-    # 1. 如果 buy_signal 为 True, 赋值为 1
-    # 2. 否则, 如果 sell_signal 为 True, 赋值为 0
-    # 3. 否则, 赋值为 default (np.nan)
-    df['position'] = np.select(condlist, choicelist, default=np.nan)
-    
-    # 关键一步: 填充信号间的持仓状态
-    # .fillna(method='ffill') 会用前一个有效值 (0或1) 填充所有 np.nan
-    df['position'].fillna(method='ffill', inplace=True)
-    
-    # 处理第一行可能仍为 NaN 的情况 (如果一开始没有信号)
-    df['position'].fillna(0, inplace=True)
-    
-    print("回测信号与持仓模拟完成。")
+    print(f"[Signal] Signal calculation complete (valid bars: {len(df)}).")
     return df
 
+# --- [MODIFIED] Function 3: run_event_driven_backtest ---
+def run_event_driven_backtest(
+    df, 
+    stop_loss_pct=0.01,
+    take_profit_pct=0.02,
+    transaction_fee_pct=0.001, 
+    trend_column_name='TREND_EMA_1H',
+    rsi_column_name='RSI_14',
+    rsi_sell_threshold=70
+):
+    """
+    Executes the event-driven backtest
+    *** [MODIFIED] SHORT-ONLY STRATEGY TEST ***
+    """
+    print(f"\n--- [Backtest] Starting Event-Driven Backtest (SL: {stop_loss_pct*100}%, TP: {take_profit_pct*100}%) ---")
+    print(f"*** [Backtest] STRATEGY-LONG: DISABLED FOR THIS TEST ***")
+    print(f"*** [Backtest] STRATEGY-SHORT: RSI > {rsi_sell_threshold}")
+    print(f"*** [Backtest] TREND FILTER: {trend_column_name} Active")
+    print(f"*** [Backtest] EXIT LOGIC: SL/TP only. ***")
+    
+    # --- [CHANGED] Use position_state: 0 = Flat, 1 = Long, -1 = Short
+    position_state = 0 
+    entry_price = 0
+    stop_loss_price = 0
+    take_profit_price = 0
+    trades_log = []
+    balance = 10000
+    balance_history = []
+    
+    # Check if the required columns exist
+    # We still check for 'buy_signal' to ensure the data is complete, even if unused
+    required_cols = [trend_column_name, rsi_column_name, 'buy_signal']
+    if not all(col in df.columns for col in required_cols):
+        print(f"[Backtest] ERROR: DataFrame is missing one or more required columns: {required_cols}")
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        print(f"[Backtest] Missing: {missing_cols}")
+        return [], pd.DataFrame()
 
-# --- [新增] 任务 3.4: 评估绩效 (包含手续费) ---
-def evaluate_performance(df, transaction_fee_percent=0.001):
+    for bar in df.itertuples():
+        
+        # Get the indicator values for this bar
+        current_rsi = getattr(bar, rsi_column_name)
+        trend_value = getattr(bar, trend_column_name)
+        
+        # 1. Check exit conditions IF IN A POSITION
+        if position_state != 0:
+            
+            # --- Check LONG position exits (This part will not be triggered) ---
+            if position_state == 1:
+                # 1a. Check StopLoss (triggered by bar.low)
+                if bar.low <= stop_loss_price:
+                    exit_price = stop_loss_price
+                    profit_pct = (exit_price / entry_price) - 1 - (transaction_fee_pct * 2) 
+                    trades_log.append({'entry_price': entry_price, 'exit_price': exit_price, 'profit_pct': profit_pct, 'exit_reason': 'StopLoss', 'type': 'Long'})
+                    balance *= (1 + profit_pct)
+                    position_state = 0 # Exit position
+                # 1b. Check TakeProfit (triggered by bar.high)
+                elif bar.high >= take_profit_price:
+                    exit_price = take_profit_price
+                    profit_pct = (exit_price / entry_price) - 1 - (transaction_fee_pct * 2)
+                    trades_log.append({'entry_price': entry_price, 'exit_price': exit_price, 'profit_pct': profit_pct, 'exit_reason': 'TakeProfit', 'type': 'Long'})
+                    balance *= (1 + profit_pct)
+                    position_state = 0 # Exit position
+
+            # --- Check SHORT position exits (This is our active logic) ---
+            elif position_state == -1:
+                # 1a. Check StopLoss (triggered by bar.high - price moved AGAINST us)
+                if bar.high >= stop_loss_price:
+                    exit_price = stop_loss_price
+                    profit_pct = (entry_price / exit_price) - 1 - (transaction_fee_pct * 2) # (entry/exit) for short profit
+                    trades_log.append({'entry_price': entry_price, 'exit_price': exit_price, 'profit_pct': profit_pct, 'exit_reason': 'StopLoss', 'type': 'Short'})
+                    balance *= (1 + profit_pct)
+                    position_state = 0 # Exit position
+                # 1b. Check TakeProfit (triggered by bar.low - price moved FOR us)
+                elif bar.low <= take_profit_price:
+                    exit_price = take_profit_price
+                    profit_pct = (entry_price / exit_price) - 1 - (transaction_fee_pct * 2)
+                    trades_log.append({'entry_price': entry_price, 'exit_price': exit_price, 'profit_pct': profit_pct, 'exit_reason': 'TakeProfit', 'type': 'Short'})
+                    balance *= (1 + profit_pct)
+                    position_state = 0 # Exit position
+
+        # 2. Check entry conditions IF FLAT (position_state == 0)
+        elif position_state == 0:
+            
+            if (not np.isnan(trend_value)):
+                
+                is_above_trend = (bar.close > trend_value)
+                is_below_trend = (bar.close < trend_value)
+                
+                # --- [MODIFIED] LONG Entry Logic ---
+                # --- DISABLED FOR THIS TEST ---
+                is_golden_cross = bar.buy_signal
+                if False and is_above_trend and is_golden_cross:
+                    # This block is now disabled
+                    entry_price = bar.close
+                    position_state = 1 # Set to LONG
+                    stop_loss_price = entry_price * (1 - stop_loss_pct)
+                    take_profit_price = entry_price * (1 + take_profit_pct)
+
+                # --- SHORT Entry Logic (Active) ---
+                # Rule: Downtrend AND Overbought
+                elif is_below_trend and (not np.isnan(current_rsi)):
+                    is_rsi_overbought = (current_rsi > rsi_sell_threshold)
+                    if is_rsi_overbought:
+                        entry_price = bar.close
+                        position_state = -1 # Set to SHORT
+                        stop_loss_price = entry_price * (1 + stop_loss_pct)   # SL is ABOVE entry price
+                        take_profit_price = entry_price * (1 - take_profit_pct) # TP is BELOW entry price
+
+        # Log balance history for equity curve
+        balance_history.append({'timestamp': bar.Index, 'balance': balance})
+
+    print("[Backtest] Event-driven backtest complete.")
+    return trades_log, pd.DataFrame(balance_history).set_index('timestamp')
+
+
+# --- [Function 4: evaluate_event_driven_performance (Unchanged)] ---
+def evaluate_event_driven_performance(trades_log, balance_history, df_market):
     """
-    评估策略绩效
-    transaction_fee_percent: 币安手续费 (0.1% = 0.001)
+    Evaluate event-driven backtest results
     """
-    if df is None or 'position' not in df.columns:
-        print("DataFrame不完整，无法评估。")
+    if not trades_log:
+        print("\n--- [Evaluate] Strategy Performance Evaluation ---")
+        print("[Evaluate] No trades generated during backtest period.")
+        strategy_total_return = 0.0
+        market_return = (df_market['close'].iloc[-1] / df_market['close'].iloc[0]) - 1
+        print(f"\n[Evaluate] Strategy total return: {strategy_total_return * 100:.2f}% (No Trades)")
+        print(f"[Evaluate] Market total return (Buy & Hold): {market_return * 100:.2f}%")
+        print("\n[Evaluate] Conclusion: Strategy successfully filtered all signals in this market.")
         return
 
-    print("\n--- 策略绩效评估 ---")
+    print("\n--- [Evaluate] Strategy Performance Evaluation ---")
     
-    # --- 步骤 1: 计算市场本身的回报 (Buy & Hold) ---
-    # 我们假设在第一根K线的收盘价买入，持有到最后
-    df['market_return_pct'] = df['close'].pct_change()
-    df['market_return_cumulative'] = (1 + df['market_return_pct']).cumprod()
-    buy_and_hold_return = df['market_return_cumulative'].iloc[-1]
+    total_trades = len(trades_log)
+    trades_df = pd.DataFrame(trades_log)
     
-    # --- 步骤 2: 计算策略回报 (Strategy Return) ---
+    # Win rate
+    wins = (trades_df['profit_pct'] > 0).sum()
+    win_rate = (wins / total_trades) * 100
     
-    # 关键: 我们在信号出现的 *下一根* K线开盘时交易
-    # 所以策略的回报 = 市场回报 * *上一根K线*的持仓状态
-    df['strategy_return_pct'] = df['market_return_pct'] * df['position'].shift(1)
+    # Profit/Loss ratio
+    avg_profit = trades_df[trades_df['profit_pct'] > 0]['profit_pct'].mean()
+    avg_loss = trades_df[trades_df['profit_pct'] <= 0]['profit_pct'].mean()
+    profit_loss_ratio = abs(avg_profit / avg_loss) if (avg_loss != 0 and not np.isnan(avg_loss)) else np.inf
     
-    # --- 步骤 3: 模拟交易手续费 ---
-    # 当持仓状态发生变化时 (0 -> 1 或 1 -> 0)，我们就支付一次手续费
-    df['trade_executed'] = (df['position'] != df['position'].shift(1))
+    # Strategy total return (based on balance curve)
+    strategy_total_return = (balance_history['balance'].iloc[-1] / balance_history['balance'].iloc[0]) - 1
     
-    if df['trade_executed'].any(): # 确保有交易发生
-        # 在发生交易的 K 线上, 减去手续费
-        df.loc[df['trade_executed'], 'strategy_return_pct'] -= transaction_fee_percent
+    # Market return (Buy & Hold)
+    market_return = (df_market['close'].iloc[-1] / df_market['close'].iloc[0]) - 1
     
-    # --- 步骤 4: 计算最终的累计回报 ---
-    df['strategy_return_cumulative'] = (1 + df['strategy_return_pct']).cumprod()
-    strategy_total_return = df['strategy_return_cumulative'].iloc[-1]
-
-    # --- 步骤 5: 打印结果 ---
-    print(f"数据周期: {df.index[0]}  至  {df.index[-1]}")
-    print(f"交易手续费 (单边): {transaction_fee_percent * 100:.2f}%")
-    print(f"总交易次数: {df['trade_executed'].sum()}")
+    print(f"[Evaluate] Total trades: {total_trades}")
+    print(f"[Evaluate] Win Rate: {win_rate:.2f}%")
+    print(f"[Evaluate] Average profit: {avg_profit*100:.2f}%")
+    print(f"[Evaluate] Average loss: {avg_loss*100:.2f}%")
+    print(f"[Evaluate] Profit/Loss Ratio: {profit_loss_ratio:.2f}")
     
-    # (1 - 1) * 100 = 0%
-    print(f"\n策略总回报 (Strategy): {(strategy_total_return - 1) * 100:.2f}%")
-    print(f"市场总回报 (Buy & Hold): {(buy_and_hold_return - 1) * 100:.2f}%")
-    
-    if strategy_total_return > buy_and_hold_return:
-        print("\n结论: 策略表现优于市场 (Buy & Hold)。")
-    else:
-        print("\n结论: 策略表现劣于市场 (Buy & Hold)。")
+    # Break down by Long/Short trades
+    if 'type' in trades_df.columns:
+        print("\n--- Trade Type Breakdown ---")
+        long_trades = trades_df[trades_df['type'] == 'Long']
+        short_trades = trades_df[trades_df['type'] == 'Short']
         
-    # (可选) 您可以取消注释下面这行来保存详细的回测结果到CSV
-    # df.to_csv("backtest_results.csv")
-    # print("详细结果已保存到 backtest_results.csv")
+        print(f"Total Long Trades: {len(long_trades)}")
+        if not long_trades.empty:
+            print(f"  Long Win Rate: {(long_trades['profit_pct'] > 0).sum() / len(long_trades) * 100:.2f}%")
+        
+        print(f"Total Short Trades: {len(short_trades)}")
+        if not short_trades.empty:
+            print(f"  Short Win Rate: {(short_trades['profit_pct'] > 0).sum() / len(short_trades) * 100:.2f}%")
+
+    
+    print(f"\n[Evaluate] Strategy total return: {strategy_total_return * 100:.2f}%")
+    
+    # [FIXED] Corrected variable name from market_total_return to market_return
+    print(f"[Evaluate] Market total return (Buy & Hold): {market_return * 100:.2f}%")
+
+    if strategy_total_return > market_return:
+        print("\n[Evaluate] Conclusion: Strategy outperforms the market (Buy & Hold).")
+    else:
+        print("\n[Evaluate] Conclusion: Strategy underperforms the market (Buy & Hold).")
 
 
-
-# --- 主程序执行 ---
+# --- [Main program execution (Unchanged)] ---
 if __name__ == "__main__":
     
-    # --- 阶段三, 任务 2.1: 拉取数据 ---
-    # 我们拉取 BTC/USDT, 5分钟线, 最近1000根 (大约3.5天的数据)
-    # 在真实回测中，您需要拉取成千上万根K线
-    crypto_df = fetch_historical_data(symbol='BTC/USDT', timeframe='5m', limit=1000)
-
-    if crypto_df is not None:
-        
-        # --- 阶段三, 任务 3.2: 计算指标 ---
-        crypto_df_with_indicators = calculate_indicators(crypto_df)
-        
-        # 显示最后5行数据，检查EMA列是否已成功添加
-        print("\n--- 数据预览 (最后5行) ---")
-        print(crypto_df_with_indicators.tail())
+    # --- 1. Define MTF Parameters ---
+    SYMBOL = 'BTC/USDT'
+    START_DATE = '2025-09-01 00:00:00' # Start date from your example
     
-        # 阶段三, 任务 3.3: 执行回测
-        backtest_df = run_backtest(crypto_df_with_indicators)
+    # --- Timeframes ---
+    CCXT_SIGNAL_TIMEFRAME = '5m'
+    PANDAS_SIGNAL_FREQ = '5T'
+    CCXT_TREND_TIMEFRAME = '1h'
+    
+    # Trend Filter Parameters
+    TREND_INDICATOR_NAME = 'TREND_EMA_1H'
+    TREND_EMA_LENGTH = 50
+    
+    # --- Signal Parameters ---
+    # Short Strategy
+    RSI_LENGTH = 14
+    RSI_COLUMN_NAME = f'RSI_{RSI_LENGTH}'
+    RSI_SELL_THRESHOLD = 70
+    
+    # Long Strategy (indicators still need to be calculated)
+    EMA_SHORT_LEN = 10
+    EMA_LONG_LEN = 30
+    
+    # --- 2. Fetch Data for Both Timeframes ---
+    
+    # Fetch signal data (5m)
+    df_signal = fetch_historical_data(
+        symbol=SYMBOL, 
+        timeframe=CCXT_SIGNAL_TIMEFRAME, 
+        from_datetime=START_DATE
+    )
+    
+    # Fetch trend data (1h)
+    df_trend = fetch_historical_data(
+        symbol=SYMBOL, 
+        timeframe=CCXT_TREND_TIMEFRAME, 
+        from_datetime=START_DATE
+    )
+
+    if df_signal is not None and df_trend is not None:
         
-        # 阶段三, 任务 3.4 & 4.1: 评估绩效
-        evaluate_performance(backtest_df, transaction_fee_percent=0.001)
+        # --- 3. Prepare MTF Data ---
+        print(f"[Main] Calculating trend indicator ({CCXT_TREND_TIMEFRAME} EMA {TREND_EMA_LENGTH})...")
+        
+        # Calculate trend EMA on the 1h data
+        trend_indicator = df_trend.ta.ema(length=TREND_EMA_LENGTH)
+        
+        # Rename it to our defined column name
+        trend_indicator.name = TREND_INDICATOR_NAME
+        
+        print(f"[Main] Resampling trend data to {PANDAS_SIGNAL_FREQ} timeframe...")
+        
+        # Resample the 1h indicator to the 5m timeframe, filling forward
+        trend_resampled = trend_indicator.resample(PANDAS_SIGNAL_FREQ).ffill() 
+        
+        # Join the 5m signal data with the resampled 15m trend data
+        df_merged = df_signal.join(trend_resampled)
+        
+        # --- 4. Calculate Signals ---
+        # We still calculate all signals, even if we only use some
+        crypto_df_with_signals = calculate_signals(
+            df_merged.copy(), 
+            rsi_length=RSI_LENGTH,
+            rsi_col_name=RSI_COLUMN_NAME,
+            ema_short_len=EMA_SHORT_LEN,
+            ema_long_len=EMA_LONG_LEN
+        )
+        
+        if crypto_df_with_signals is None or crypto_df_with_signals.empty:
+            print("[Main] No valid data after signal calculation. Exiting.")
+        else:
+            # --- 5. Execute Event-Driven Backtest ---
+            trades_log, balance_history = run_event_driven_backtest(
+                crypto_df_with_signals,
+                stop_loss_pct=0.01,    # 1% stop loss
+                take_profit_pct=0.02,  # 2% take profit
+                transaction_fee_pct=0.001, # 0.1% transaction fee
+                trend_column_name=TREND_INDICATOR_NAME,
+                rsi_column_name=RSI_COLUMN_NAME,
+                rsi_sell_threshold=RSI_SELL_THRESHOLD
+            )
+            
+            # --- 6. Evaluate Performance ---
+            evaluate_event_driven_performance(trades_log, balance_history, crypto_df_with_signals)
+    
+    else:
+        print("[Main] Failed to fetch data for one or both timeframes. Exiting.")
