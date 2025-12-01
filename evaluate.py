@@ -1,5 +1,5 @@
 # evaluate.py
-# [MODIFIED] Added Long/Short performance breakdown.
+# [MODIFIED] Trade Type Breakdown logic is now robust.
 
 import pandas as pd
 import numpy as np
@@ -9,7 +9,7 @@ def evaluate_event_driven_performance(trades_log, balance_history, df_market, in
     Evaluate event-driven backtest results
     """
     
-    # --- Calculate Advanced Metrics from Equity Curve ---
+    # --- [NEW] Calculate Advanced Metrics from Equity Curve ---
     max_drawdown = 0.0
     sharpe_ratio = 0.0
     
@@ -49,7 +49,7 @@ def evaluate_event_driven_performance(trades_log, balance_history, df_market, in
         else:
             sharpe_ratio = np.nan
     
-    # --- Original Report ---
+    # --- [Original Report] ---
     if not trades_log:
         print("\n--- [Evaluate] Strategy Performance Evaluation ---")
         print("[Evaluate] No trades generated during backtest period.")
@@ -74,11 +74,14 @@ def evaluate_event_driven_performance(trades_log, balance_history, df_market, in
         print(f"[Evaluate] Average loss: {avg_loss:.2f}%")
         print(f"[Evaluate] Profit/Loss Ratio: {profit_loss_ratio:.2f}")
 
-        # --- [NEW] Break down by Long/Short trades ---
+        # --- [FIXED] Break down by Long/Short trades ---
         if 'type' in trades_df.columns:
             print("\n--- Trade Type Breakdown ---")
-            long_trades = trades_df[trades_df['type'] == 'Long']
-            short_trades = trades_df[trades_df['type'] == 'Short']
+            
+            # [FIX] Check for *any* type that is NOT a short
+            # This is robust to 'N_PATTERN_VOL', 'MR_GRID', etc.
+            long_trades = trades_df[trades_df['type'].str.contains('SHORT') == False]
+            short_trades = trades_df[trades_df['type'].str.contains('SHORT') == True]
             
             print(f"Total Long Trades: {len(long_trades)}")
             if not long_trades.empty:

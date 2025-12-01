@@ -1,5 +1,5 @@
 # data_handler.py
-# [MODIFIED] Calculates KC Upper & Lower bands, and a Short exit signal.
+# [MODIFIED] Simplified: Only calculates indicators needed for this strategy.
 
 import pandas as pd
 import pandas_ta as ta
@@ -122,79 +122,25 @@ class DataHandler:
         )
         
         # Daily Exit Signal (for LONGS)
+        # [NOTE] This is no longer used by portfolio.py, but harmless to leave
         df_filter['DAILY_EXIT_SIGNAL'] = (
             (df_filter['close'].shift(1) < df_filter[ma_col].shift(1)) &
             (df_filter['close'].shift(2) < df_filter[ma_col].shift(2))
         )
-        
-        # [NEW] Daily Cover Signal (for SHORTS)
-        df_filter['DAILY_COVER_SIGNAL'] = (
-            (df_filter['close'].shift(1) > df_filter[ma_col].shift(1)) &
-            (df_filter['close'].shift(2) > df_filter[ma_col].shift(2))
-        )
 
-        # [REMOVED] Daily ADX logic
-        
         # 3. Resample Daily data to Entry timeframe
         print(f"[DataHandler] Resampling Daily data to {self.config['entry_timeframe']}...")
-        
-        # [MODIFIED] Add the new daily_cover_signal to the list
-        filter_cols_to_resample = ['MA_TREND_DAILY', 'DAILY_EXIT_SIGNAL', 'DAILY_COVER_SIGNAL']
-        
+        filter_cols_to_resample = ['MA_TREND_DAILY', 'DAILY_EXIT_SIGNAL']
         df_filter_resampled = df_filter[filter_cols_to_resample].resample(self.config['pandas_entry_freq']).ffill()
         
-        # 4. Calculate Entry (1H) Indicators
+        # 4. Calculate Entry (4H) Indicators
         print(f"[DataHandler] Calculating Entry ({self.config['entry_timeframe']}) indicators...")
         
-        # 4a. 1H Average Volume
+        # 4a. 4H Average Volume (still needed by N-Pattern)
         vol_avg_col = f"VOL_AVG_{self.config['vol_avg_period']}"
         df_entry[vol_avg_col] = df_entry.ta.ema(length=self.config['vol_avg_period'], source='volume')
 
-        # 4b. Indicator for RSI (harmless to calculate)
-        rsi_col_name = self.config['rsi_col_name']
-        df_entry[rsi_col_name] = df_entry.ta.rsi(length=self.config['rsi_length'])
-
-        # 4c. Indicator for ATR (harmless to calculate)
-        atr_col_name = self.config['atr_col_name']
-        df_entry[atr_col_name] = df_entry.ta.atr(
-            length=self.config['atr_length'], 
-            high=df_entry['high'], 
-            low=df_entry['low'], 
-            close=df_entry['close']
-        )
-        
-        # 4d. [MODIFIED] Indicator for Keltner Channel Filter
-        try:
-            print("[DataHandler] Calculating Keltner Channels...")
-            kc_df = df_entry.ta.kc(
-                length=self.config['kc_length'], 
-                scalar=self.config['kc_multiplier'],
-                mamode="EMA", 
-                append=True
-            )
-            
-            # Find and rename Upper Band
-            kc_upper_col_dynamic = next((col for col in kc_df.columns if col.startswith('KCU')), None)
-            static_kc_upper = self.config['kc_upper_col_name']
-            if kc_upper_col_dynamic:
-                print(f"[DataHandler] Detected KC Upper Band: {kc_upper_col_dynamic}. Renaming to: {static_kc_upper}")
-                df_entry.rename(columns={kc_upper_col_dynamic: static_kc_upper}, inplace=True)
-            else:
-                print("[DataHandler] WARNING: Could not find Keltner Channel Upper Band column.")
-
-            # [NEW] Find and rename Lower Band
-            kc_lower_col_dynamic = next((col for col in kc_df.columns if col.startswith('KCL')), None)
-            static_kc_lower = self.config['kc_lower_col_name']
-            if kc_lower_col_dynamic:
-                print(f"[DataHandler] Detected KC Lower Band: {kc_lower_col_dynamic}. Renaming to: {static_kc_lower}")
-                df_entry.rename(columns={kc_lower_col_dynamic: static_kc_lower}, inplace=True)
-            else:
-                print("[DataHandler] WARNING: Could not find Keltner Channel Lower Band column.")
-
-        except KeyError as e:
-            print(f"[DataHandler] WARNING: Missing Keltner Channel config: {e}. Skipping KC calculation.")
-        except Exception as e:
-            print(f"[DataHandler] WARNING: Failed to calculate Keltner Channels: {e}")
+        # [REMOVED] Other indicators (RSI, ATR, KC, ADX) are not needed
 
         # 5. Merge DataFrames
         print("[DataHandler] Merging dataframes...")

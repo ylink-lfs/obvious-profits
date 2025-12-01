@@ -16,7 +16,7 @@ from strategy import npattern_symmetric
 if __name__ == "__main__":
     
     # --- [NEW] Set the active strategy here ---
-    ACTIVE_STRATEGY = npattern_symmetric.SymmetricNPatternStrategy
+    ACTIVE_STRATEGY = npattern_symmetric.NPatternStrategy
     # ------------------------------------------
 
     # 1. Initialize the Engine with our config and selected strategy

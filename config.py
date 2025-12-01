@@ -1,39 +1,34 @@
 # config.py
-# [MODIFIED] Combining N-Pattern (vol=1.0) + KC Filter + ATR Stop Loss
+# [MODIFIED] Reverted to best config (4H, vol=0.0, risk=2.0%)
+# [NEW] Added R:R Take Profit parameter
 
 CONFIG = {
     # Data parameters
     'symbol': 'BTC/USDT',
     'start_date': '2020-01-01 00:00:00',
     'filter_timeframe': '1d',
-    'entry_timeframe': '1h',      # Use 1h for more signals
+    'entry_timeframe': '4h',
     'pandas_filter_freq': '1D',
-    'pandas_entry_freq': 'h',     # Use 'h' for 1h
+    'pandas_entry_freq': '4H',
+
+    # --- Trend Filter ---
+    'filter_ma_period': 200,
 
     # --- N-Pattern Strategy Parameters ---
-    'filter_ma_period': 200,
     'vol_avg_period': 20,
-    'vol_multiplier': 1.0, # [CHANGED] Use 1.0 (from 50% win rate test)
+    'vol_multiplier': 0.0, # Keep vol=0.0 (our best strategy)
 
-    # --- Keltner Channel Filter Parameters ---
-    'kc_length': 20,
-    'kc_multiplier': 2.0,
-    'kc_upper_col_name': 'KC_UPPER_STATIC', # Static name
+    # --- [NEW] R:R Take Profit Parameter ---
+    'RR_MULTIPLIER': 3.0, # Take Profit at 3x the initial risk
 
-    # --- [MODIFIED] ATR Stop Loss Parameters (NOW ACTIVE) ---
-    'atr_length': 14,
-    'atr_col_name': 'ATR_14',
-    'atr_sl_multiplier': 3.0,   # SL = Entry - (ATR * 3.0)
-
-    # --- RSI Parameters (Still needed for DataHandler) ---
+    # --- (Unused parameters, for DataHandler compatibility) ---
+    # (These are not used by the strategy but ensures data_handler doesn't crash)
     'rsi_length': 14,
     'rsi_col_name': 'RSI_14',
-    # (These are unused by this strategy but DataHandler calculates them)
-    'rsi_overbought_threshold': 70,
-    'rsi_buy_threshold': 30,
-    'rsi_reset_threshold': 50,
+    'atr_length': 14,
+    'atr_col_name': 'ATR_14',
 
     # --- Portfolio Parameters ---
     'initial_capital': 10000,
-    'risk_per_trade_percent': 0.02
+    'risk_per_trade_percent': 0.02 # [REVERTED] Back to 2%
 }

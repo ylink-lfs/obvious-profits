@@ -1,5 +1,5 @@
 # portfolio.py
-# [MODIFIED] Upgraded to handle symmetrical trend exits.
+# [MODIFIED] Replaced TrendExit with a fixed R:R Take Profit logic.
 
 import numpy as np
 
@@ -16,16 +16,21 @@ class Portfolio:
         
         # State: 0 = FLAT, 1 = LONG, -1 = SHORT
         self.state = 0
-        self.position_size = 0.0 # In units (e.g., 1.5 BTC)
+        self.trade_type = None # e.g. 'N_PATTERN'
+        
+        self.position_size = 0.0
         self.entry_price = 0.0
         self.stop_loss_price = 0.0
+        
+        # [NEW] This will be set by handle_entry_signal
+        self.take_profit_price = 0.0 
         
         self.trades_log = []
         self.balance_history = []
 
     def check_for_exit(self, bar, fee_pct=0.001):
         """
-        Checks exit conditions (SL or Trend) for an open position.
+        Checks exit conditions (SL or TP) for an open position.
         Returns True if a trade was closed.
         """
         if self.state == 0:
@@ -39,24 +44,24 @@ class Portfolio:
                 self._execute_exit(bar, exit_price, 'StopLoss', fee_pct)
                 return True
                 
-            # 2. Check for Trend Exit (Daily Exit Signal)
-            if bar.DAILY_EXIT_SIGNAL == True:
-                exit_price = bar.close 
-                self._execute_exit(bar, exit_price, 'TrendExit', fee_pct)
+            # 2. [MODIFIED] Check for R:R Take Profit
+            elif bar.high >= self.take_profit_price:
+                exit_price = self.take_profit_price
+                self._execute_exit(bar, exit_price, 'TakeProfit_RR', fee_pct)
                 return True
         
-        # --- [MODIFIED] Check SHORT position exits ---
+        # --- (Short logic is currently disabled, but we keep the code) ---
         elif self.state == -1:
-            # 1. Check for Stop Loss (price moved AGAINST us)
+            # 1. Check for Stop Loss
             if bar.high >= self.stop_loss_price:
                 exit_price = self.stop_loss_price
                 self._execute_exit(bar, exit_price, 'StopLoss', fee_pct)
                 return True
             
-            # 2. [MODIFIED] Check for Trend Exit (Daily COVER Signal)
-            if bar.DAILY_COVER_SIGNAL == True:
-                exit_price = bar.close
-                self._execute_exit(bar, exit_price, 'TrendExit', fee_pct)
+            # 2. [MODIFIED] Check for R:R Take Profit
+            elif bar.low <= self.take_profit_price:
+                exit_price = self.take_profit_price
+                self._execute_exit(bar, exit_price, 'TakeProfit_RR', fee_pct)
                 return True
             
         return False
@@ -69,12 +74,12 @@ class Portfolio:
             profit_amt = self.position_size * (exit_price - self.entry_price)
             entry_cost = self.position_size * self.entry_price
             exit_value = self.position_size * exit_price
-            trade_type = 'Long'
+            trade_type = self.trade_type # 'N_PATTERN'
         elif self.state == -1: # Short
             profit_amt = self.position_size * (self.entry_price - exit_price)
-            entry_cost = self.position_size * self.entry_price # Cost is still based on entry
+            entry_cost = self.position_size * self.entry_price
             exit_value = self.position_size * exit_price
-            trade_type = 'Short'
+            trade_type = self.trade_type # e.g. 'N_PATTERN_SHORT'
         else:
             return # Should not happen
 
@@ -105,11 +110,13 @@ class Portfolio:
         
         # Reset state
         self.state = 0
+        self.trade_type = None
         self.position_size = 0.0
         self.entry_price = 0.0
         self.stop_loss_price = 0.0
+        self.take_profit_price = 0.0 # [NEW] Reset TP
 
-    def handle_entry_signal(self, bar, signal_type, entry_price, stop_loss_price):
+    def handle_entry_signal(self, bar, signal_type, entry_price, stop_loss_price, trade_type):
         """
         Calculates position size and executes a new entry (Long or Short).
         """
@@ -132,18 +139,35 @@ class Portfolio:
         risk_per_trade_amount = self.balance * self.risk_pct
         position_size = risk_per_trade_amount / risk_per_unit
         
-        # 3. Set position state
+        # --- [NEW] 3. Calculate R:R Take Profit ---
+        rr_multiplier = self.config.get('RR_MULTIPLIER', None)
+        
+        if rr_multiplier:
+            if signal_type == 'BUY':
+                take_profit_price = entry_price + (risk_per_unit * rr_multiplier)
+            else: # SELL
+                take_profit_price = entry_price - (risk_per_unit * rr_multiplier)
+        else:
+            # If no multiplier, set TP to infinity (for Long) or 0 (for Short)
+            take_profit_price = np.inf if signal_type == 'BUY' else 0.0
+            print("[Portfolio] WARNING: 'RR_MULTIPLIER' not in config. Using no Take Profit.")
+
+        
+        # 4. Set position state
         self.state = 1 if signal_type == 'BUY' else -1
+        self.trade_type = trade_type
         self.position_size = position_size
         self.entry_price = entry_price
         self.stop_loss_price = stop_loss_price
+        self.take_profit_price = take_profit_price # [NEW]
         
         print(f"--- [TRADE OPENED] ---")
         print(f"     Time: {bar.Index}")
-        print(f"     Type: {'LONG' if self.state == 1 else 'SHORT'}")
+        print(f"     Type: {trade_type}")
         print(f"     Size: {position_size:.4f} units")
         print(f"    Entry: {entry_price:.2f}")
         print(f"       SL: {stop_loss_price:.2f}")
+        print(f"       TP: {take_profit_price:.2f}") # [NEW]
 
     def update_balance_history(self, bar):
         """ Updates the equity curve at each bar. """
