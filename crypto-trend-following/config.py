@@ -1,46 +1,70 @@
 # config.py
-# [MODIFIED] Added Bollinger Band and ADX Chop parameters
+# Meme Coin Momentum Strategy Configuration
 
 import pandas as pd
 
 def to_ms(date_str):
+    """Convert date string to milliseconds timestamp."""
     return int(pd.Timestamp(date_str).value // 10**6)
 
 CONFIG = {
-    # --- Data Parameters ---
-    'symbol': 'BTC/USDT',
-    'timeframe': '4h', 
-    'pandas_freq': '4h',
+    # --- Data Source Paths ---
+    # Futures data path (contains contract kline data in zip format)
+    'futures_data_path': '/path/to/futures/um/daily/klines',
+    # Spot data path (for BTC reference)
+    'spot_data_path': '/path/to/spot/daily/klines',
     
-    # --- Train / Test Split ---
-    'train_start_date': to_ms('2020-01-01 00:00:00'),
-    'train_end_date':   to_ms('2023-12-31 23:59:59'),
-    'test_start_date':  to_ms('2024-01-01 00:00:00'),
-    'test_end_date':    to_ms('2025-10-31 23:59:59'),
-
-    # --- Strategy Parameters: Mean Reversion (BB) ---
+    # --- Backtest Date Range ---
+    'backtest_start_date': to_ms('2024-01-01 00:00:00'),
+    'backtest_end_date': to_ms('2024-12-31 23:59:59'),
+    
+    # --- Data Parameters ---
+    'timeframe': '1m',  # Primary timeframe for entry/exit
+    
+    # --- Universe Filters ---
+    # Stablecoins to exclude
+    'excluded_stablecoins': ['USDC', 'TUSD', 'FDUSD', 'BUSD', 'DAI', 'USDD', 'USDP'],
+    # Index contracts to exclude
+    'excluded_indices': ['BTCDOM', 'DEFI', 'FOOTBALL', 'BLUEBIRD'],
+    # Low volatility giants to exclude
+    'excluded_giants': ['BTC', 'ETH'],
+    
+    # --- Universe Selection ---
+    'top_gainers_count': 30,  # Select top N 24h gainers
+    'universe_check_interval_minutes': 60,  # Check universe every 60 minutes
+    
+    # --- Entry Signal Parameters ---
+    # System Circuit Breaker (BTC 1h change threshold)
+    'btc_hourly_drop_threshold': -0.015,  # -1.5%
+    
+    # Bollinger Band for Volatility Breakout
     'bb_length': 20,
     'bb_std': 2.0,
-    'bb_lower_col': 'BB_LOWER_STATIC',   # [修改] 使用静态名称
-    'bb_middle_col': 'BB_MIDDLE_STATIC', # [修改] 使用静态名称
-
-    # --- Filter Parameters: ADX Chop ---
-    'adx_length': 14,
-    'adx_col_name': 'ADX_14',
-    'adx_chop_threshold': 30, # ADX < 30 means "Choppy Market"
-
-    # --- Risk Management ---
-    'atr_length': 14,
-    'atr_col_name': 'ATR_14',
-    'atr_sl_multiplier': 1.0, # Tighter SL for mean reversion
-
-    # --- Portfolio Parameters ---
-    'initial_capital': 10000,
-    'risk_per_trade_percent': 0.02,
     
-    # --- Unused (Compatibility) ---
-    'ma_period': 20, 'ma_col_name': 'MA_20',
-    'macd_fast': 12, 'macd_slow': 26, 'macd_signal': 9,
-    'macd_col_name': 'MACD', 'macd_signal_col_name': 'MACDs',
-    'divergence_lookback': 20
+    # Volume Confirmation
+    'volume_ma_length': 20,
+    'volume_multiplier': 2.0,
+    
+    # --- Exit Signal Parameters ---
+    # Disaster Stop Loss (hard stop)
+    'disaster_stop_pct': 0.04,  # -4%
+    
+    # Structural Exit - Lowest Low Lookback (can try 30 or 60)
+    'structural_exit_lookback': 20,
+    
+    # Time Stop
+    'time_stop_minutes': 45,
+    'time_stop_min_profit_pct': 0.015,  # 1.5%
+    
+    # --- Portfolio / Risk Management ---
+    'initial_capital': 2050,
+    'position_size_usd': 500,
+    'leverage': 1,
+    
+    # --- Trading Costs ---
+    'fee_rate': 0.0005,  # 0.05% per trade
+    'slippage_rate': 0.005,  # 0.5% slippage (applied to both buy and sell)
+    
+    # --- Contract Listing Cache ---
+    'listing_cache_file': 'contract_listings.json',
 }

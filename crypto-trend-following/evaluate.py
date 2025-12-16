@@ -1,39 +1,43 @@
 # evaluate.py
-# [MODIFIED] Trade Type Breakdown logic is now robust.
+# Meme Coin Strategy Performance Evaluation
 
-import pandas as pd
 import numpy as np
 
-def evaluate_event_driven_performance(trades_log, balance_history, df_market, initial_capital):
+__all__ = ['evaluate_performance']
+
+
+def evaluate_performance(trades_df, balance_df, initial_capital):
     """
-    Evaluate event-driven backtest results
-    """
+    Evaluate backtest performance.
     
-    # --- [NEW] Calculate Advanced Metrics from Equity Curve ---
+    Args:
+        trades_df: DataFrame with trade records
+        balance_df: DataFrame with balance history
+        initial_capital: Starting capital
+    """
+    print("\n" + "=" * 60)
+    print("  PERFORMANCE EVALUATION")
+    print("=" * 60)
+    
+    # --- Equity Curve Metrics ---
     max_drawdown = 0.0
     sharpe_ratio = 0.0
     
-    if balance_history is not None and not balance_history.empty:
-        equity_curve = balance_history['balance']
+    if balance_df is not None and not balance_df.empty:
+        equity_curve = balance_df['balance']
         
-        # 1. Calculate Maximum Drawdown (MDD)
-        print("[Evaluate] Calculating Max Drawdown...")
+        # 1. Maximum Drawdown
         rolling_peak = equity_curve.cummax()
         drawdown = (equity_curve - rolling_peak) / rolling_peak
         max_drawdown = drawdown.min()
         
-        # 2. Calculate Annualized Sharpe Ratio
-        print("[Evaluate] Calculating Annualized Sharpe Ratio...")
+        # 2. Sharpe Ratio (annualized)
         periodic_returns = equity_curve.pct_change().dropna()
         
         if len(periodic_returns) > 1:
             try:
-                # Infer timeframe
-                time_delta = balance_history.index[1] - balance_history.index[0]
-                periods_per_day = pd.Timedelta('1D') / time_delta
-                periods_per_year = periods_per_day * 365 
-                
-                print(f"[Evaluate] Inferred {periods_per_year:.0f} periods per year for annualization.")
+                # Assume 1-minute bars
+                periods_per_year = 365 * 24 * 60
                 
                 mean_return_annual = periodic_returns.mean() * periods_per_year
                 std_dev_annual = periodic_returns.std() * np.sqrt(periods_per_year)
@@ -44,64 +48,75 @@ def evaluate_event_driven_performance(trades_log, balance_history, df_market, in
                     sharpe_ratio = np.inf
                     
             except Exception as e:
-                print(f"[Evaluate] WARNING: Could not calculate Sharpe Ratio. Error: {e}")
+                print(f"[Evaluate] Warning: Could not calculate Sharpe Ratio: {e}")
                 sharpe_ratio = np.nan
-        else:
-            sharpe_ratio = np.nan
     
-    # --- [Original Report] ---
-    if not trades_log:
-        print("\n--- [Evaluate] Strategy Performance Evaluation ---")
-        print("[Evaluate] No trades generated during backtest period.")
-        strategy_total_return = 0.0
-    else:
-        print("\n--- [Evaluate] Strategy Performance Evaluation ---")
-        total_trades = len(trades_log)
-        trades_df = pd.DataFrame(trades_log)
-        
-        wins = (trades_df['net_profit_pct'] > 0).sum()
-        win_rate = (wins / total_trades) * 100
-        
-        avg_profit = trades_df[trades_df['net_profit_pct'] > 0]['net_profit_pct'].mean()
-        avg_loss = trades_df[trades_df['net_profit_pct'] <= 0]['net_profit_pct'].mean()
-        profit_loss_ratio = abs(avg_profit / avg_loss) if (avg_loss != 0 and not np.isnan(avg_loss)) else np.inf
-        
-        strategy_total_return = (balance_history['balance'].iloc[-1] / initial_capital) - 1
-        
-        print(f"[Evaluate] Total trades: {total_trades}")
-        print(f"[Evaluate] Win Rate: {win_rate:.2f}%")
-        print(f"[Evaluate] Average profit: {avg_profit:.2f}%")
-        print(f"[Evaluate] Average loss: {avg_loss:.2f}%")
-        print(f"[Evaluate] Profit/Loss Ratio: {profit_loss_ratio:.2f}")
-
-        # --- [FIXED] Break down by Long/Short trades ---
-        if 'type' in trades_df.columns:
-            print("\n--- Trade Type Breakdown ---")
-            
-            # [FIX] Check for *any* type that is NOT a short
-            # This is robust to 'N_PATTERN_VOL', 'MR_GRID', etc.
-            long_trades = trades_df[trades_df['type'].str.contains('SHORT') == False]
-            short_trades = trades_df[trades_df['type'].str.contains('SHORT') == True]
-            
-            print(f"Total Long Trades: {len(long_trades)}")
-            if not long_trades.empty:
-                print(f"  Long Win Rate: {(long_trades['net_profit_pct'] > 0).sum() / len(long_trades) * 100:.2f}%")
-            
-            print(f"Total Short Trades: {len(short_trades)}")
-            if not short_trades.empty:
-                print(f"  Short Win Rate: {(short_trades['net_profit_pct'] > 0).sum() / len(short_trades) * 100:.2f}%")
-
-    # Market return (Buy & Hold)
-    market_return = (df_market['close'].iloc[-1] / df_market['close'].iloc[0]) - 1
+    # --- Trade Metrics ---
+    if trades_df is None or trades_df.empty:
+        print("\n[Evaluate] No trades generated during backtest period.")
+        return
     
-    print("\n--- [Portfolio & Risk Metrics] ---")
-    print(f"[Evaluate] Strategy total return: {strategy_total_return * 100:.2f}%")
-    print(f"[Evaluate] Market total return (Buy & Hold): {market_return * 100:.2f}%")
-    print(f"[Evaluate] Max Drawdown (MDD): {max_drawdown * 100:.2f}%")
-    print(f"[Evaluate] Sharpe Ratio (Annualized): {sharpe_ratio:.2f}")
-
-
-    if strategy_total_return > market_return:
-        print("\n[Evaluate] Conclusion: Strategy outperforms the market (Buy & Hold).")
-    else:
-        print("\n[Evaluate] Conclusion: Strategy underperforms the market (Buy &Hold).")
+    total_trades = len(trades_df)
+    
+    # Win/Loss Analysis
+    wins = (trades_df['pnl_usd'] > 0).sum()
+    losses = (trades_df['pnl_usd'] <= 0).sum()
+    win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+    
+    # Profit/Loss
+    total_profit = trades_df[trades_df['pnl_usd'] > 0]['pnl_usd'].sum()
+    total_loss = abs(trades_df[trades_df['pnl_usd'] <= 0]['pnl_usd'].sum())
+    net_pnl = total_profit - total_loss
+    
+    # Average Trade
+    avg_win = trades_df[trades_df['pnl_usd'] > 0]['pnl_pct'].mean() if wins > 0 else 0
+    avg_loss = trades_df[trades_df['pnl_usd'] <= 0]['pnl_pct'].mean() if losses > 0 else 0
+    
+    # Profit Factor
+    profit_factor = total_profit / total_loss if total_loss > 0 else np.inf
+    
+    # Final Balance
+    final_balance = balance_df['balance'].iloc[-1] if not balance_df.empty else initial_capital
+    total_return = ((final_balance - initial_capital) / initial_capital) * 100
+    
+    # Print Results
+    print("\n--- Trade Statistics ---")
+    print(f"Total Trades: {total_trades}")
+    print(f"Winning Trades: {wins}")
+    print(f"Losing Trades: {losses}")
+    print(f"Win Rate: {win_rate:.2f}%")
+    
+    print("\n--- Profit/Loss ---")
+    print(f"Total Profit: ${total_profit:.2f}")
+    print(f"Total Loss: ${total_loss:.2f}")
+    print(f"Net P&L: ${net_pnl:.2f}")
+    print(f"Profit Factor: {profit_factor:.2f}")
+    
+    print("\n--- Average Trade ---")
+    print(f"Average Win: {avg_win:.2f}%")
+    print(f"Average Loss: {avg_loss:.2f}%")
+    
+    print("\n--- Portfolio Metrics ---")
+    print(f"Initial Capital: ${initial_capital:.2f}")
+    print(f"Final Balance: ${final_balance:.2f}")
+    print(f"Total Return: {total_return:.2f}%")
+    print(f"Max Drawdown: {max_drawdown * 100:.2f}%")
+    print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
+    
+    # Exit Reason Breakdown
+    print("\n--- Exit Reason Breakdown ---")
+    exit_counts = trades_df['exit_reason'].value_counts()
+    for reason, count in exit_counts.items():
+        pct = (count / total_trades) * 100
+        print(f"  {reason}: {count} ({pct:.1f}%)")
+    
+    # Top/Bottom Trades
+    print("\n--- Best Trades ---")
+    best_trades = trades_df.nlargest(3, 'pnl_pct')
+    for _, trade in best_trades.iterrows():
+        print(f"  {trade['symbol']}: +{trade['pnl_pct']:.2f}%")
+    
+    print("\n--- Worst Trades ---")
+    worst_trades = trades_df.nsmallest(3, 'pnl_pct')
+    for _, trade in worst_trades.iterrows():
+        print(f"  {trade['symbol']}: {trade['pnl_pct']:.2f}%")

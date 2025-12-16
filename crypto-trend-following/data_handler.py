@@ -1,122 +1,368 @@
 # data_handler.py
-# [MODIFIED] Explicitly passes columns to ATR/ADX/BBands to fix calculation errors.
+# Meme Coin Strategy Data Handler
+# Handles loading and preparing kline data from zip files for futures and spot markets
 
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta  # noqa: F401 - used via df.ta accessor
 import os
-import numpy as np
+import zipfile
 import glob
+from typing import Dict, Optional
 
-class DataHandler:
+
+class MemeDataHandler:
+    """
+    Data handler for meme coin momentum strategy.
+    Supports loading data from zip files for multiple contracts.
+    """
+    
     def __init__(self, config):
-        print("[DataHandler] Initializing...")
+        print("[DataHandler] Initializing MemeDataHandler...")
         self.config = config
-        self.base_data_dir = os.path.join(os.path.dirname(__file__), 'data', 'binance_public_kline')
-
-    def _load_csv_data(self, timeframe, start_ts, end_ts=None):
+        self.futures_data_path = config['futures_data_path']
+        self.spot_data_path = config['spot_data_path']
+        
+        # Cache for loaded data
+        self._data_cache: Dict[str, pd.DataFrame] = {}
+        self._btc_spot_cache: Optional[pd.DataFrame] = None
+    
+    def load_contract_data(
+        self, 
+        symbol: str, 
+        start_ts: int, 
+        end_ts: int,
+        timeframe: str = '1m'
+    ) -> Optional[pd.DataFrame]:
         """
-        Load kline data from CSV files.
+        Load kline data for a specific contract.
+        
+        Args:
+            symbol: Contract symbol (e.g., 'BTCUSDT')
+            start_ts: Start timestamp in milliseconds
+            end_ts: End timestamp in milliseconds
+            timeframe: Kline timeframe (default '1m')
+            
+        Returns:
+            DataFrame with OHLCV data indexed by timestamp
         """
-        start_date_str = pd.to_datetime(start_ts, unit='ms')
-        end_date_str = pd.to_datetime(end_ts, unit='ms') if end_ts else "Now"
-        print(f"[DataHandler] Loading {self.config['symbol']} {timeframe} data ({start_date_str} to {end_date_str})...")
+        cache_key = f"{symbol}_{timeframe}_{start_ts}_{end_ts}"
+        if cache_key in self._data_cache:
+            return self._data_cache[cache_key]
         
-        symbol = self.config['symbol'].replace('/', '')
-        csv_dir = os.path.join(self.base_data_dir, symbol, timeframe)
+        # Construct path to contract data
+        contract_path = os.path.join(self.futures_data_path, symbol, timeframe)
         
-        if not os.path.exists(csv_dir):
-            raise FileNotFoundError(f"Data directory not found: {csv_dir}")
+        if not os.path.exists(contract_path):
+            return None
         
-        csv_files = sorted(glob.glob(os.path.join(csv_dir, f"{symbol}-{timeframe}-*.csv")))
-        if not csv_files:
-            raise FileNotFoundError(f"No CSV files found in: {csv_dir}")
+        df = self._load_zip_data(contract_path, symbol, timeframe, start_ts, end_ts)
         
-        dfs = []
-        for csv_file in csv_files:
-            try:
-                df_temp = pd.read_csv(csv_file, header=None, names=[
-                    'open_time', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'quote_asset_volume', 'number_of_trades',
-                    'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-                ])
-                filename = os.path.basename(csv_file)
-                parts = filename.split('-')
-                # Handle 2025+ timestamps (us to ms)
-                if len(parts) >= 4 and int(parts[2]) >= 2025:
-                    df_temp['open_time'] = df_temp['open_time'] / 1000
-                dfs.append(df_temp)
-            except Exception:
-                continue
+        if df is not None and not df.empty:
+            self._data_cache[cache_key] = df
         
-        df = pd.concat(dfs, ignore_index=True)
-        df['timestamp'] = pd.to_datetime(df['open_time'], unit='ms')
-        
-        # Ensure columns are strictly lowercase and float
-        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-        
-        target_start_dt = pd.to_datetime(start_ts, unit='ms')
-        mask = (df['timestamp'] >= target_start_dt)
-        if end_ts:
-            mask = mask & (df['timestamp'] <= pd.to_datetime(end_ts, unit='ms'))
-        df = df.loc[mask]
-        
-        df.drop_duplicates(subset='timestamp', inplace=True)
-        df.sort_values('timestamp', inplace=True)
-        df.set_index('timestamp', inplace=True)
-        df = df.astype(float)
-        
-        if df.empty: raise ValueError("No data found")
-        print(f"[DataHandler] Loaded {len(df)} bars.")
         return df
-
-    def _robust_rename(self, df, dynamic_prefix, static_name):
-        """ Helper to find and rename columns like BBL_20_2.0 -> BB_LOWER_STATIC """
-        dynamic_col = next((col for col in df.columns if col.startswith(dynamic_prefix)), None)
-        if dynamic_col:
-            print(f"[DataHandler] Renaming {dynamic_col} -> {static_name}")
-            df.rename(columns={dynamic_col: static_name}, inplace=True)
-        else:
-            print(f"[DataHandler] WARNING: Could not find column starting with '{dynamic_prefix}'")
-
-    def prepare_data(self, start_ts, end_ts=None):
-        timeframe = self.config['timeframe']
-        df = self._load_csv_data(timeframe, start_ts, end_ts)
+    
+    def load_btc_spot_data(self, start_ts: int, end_ts: int) -> Optional[pd.DataFrame]:
+        """
+        Load BTC spot data for reference (circuit breaker, relative strength).
         
-        print("[DataHandler] Calculating Indicators...")
+        Args:
+            start_ts: Start timestamp in milliseconds
+            end_ts: End timestamp in milliseconds
+            
+        Returns:
+            DataFrame with BTCUSDT spot OHLCV data
+        """
+        if self._btc_spot_cache is not None:
+            # Filter to requested range
+            mask = (self._btc_spot_cache.index >= pd.to_datetime(start_ts, unit='ms')) & \
+                   (self._btc_spot_cache.index <= pd.to_datetime(end_ts, unit='ms'))
+            return self._btc_spot_cache.loc[mask]
         
-        # 1. ADX (For Filter)
-        # [FIX] Explicitly pass High, Low, Close
-        df.ta.adx(
-            high=df['high'], 
-            low=df['low'], 
-            close=df['close'], 
-            length=self.config['adx_length'], 
-            append=True
-        )
+        btc_path = os.path.join(self.spot_data_path, 'BTCUSDT', '1m')
         
-        # 2. Bollinger Bands (For Strategy)
-        # [FIX] Explicitly pass Close
-        df.ta.bbands(
-            close=df['close'],
-            length=self.config['bb_length'], 
-            std=self.config['bb_std'], 
-            append=True
-        )
-        self._robust_rename(df, 'BBL', self.config['bb_lower_col'])
-        self._robust_rename(df, 'BBM', self.config['bb_middle_col'])
+        if not os.path.exists(btc_path):
+            print(f"[DataHandler] WARNING: BTC spot data path not found: {btc_path}")
+            return None
         
-        # 3. ATR (For Stop Loss) - [CRITICAL FIX]
-        # [FIX] Explicitly pass High, Low, Close. This fixes the "Invalid risk" error.
-        df[self.config['atr_col_name']] = df.ta.atr(
-            high=df['high'], 
-            low=df['low'], 
-            close=df['close'],
-            length=self.config['atr_length']
-        )
+        df = self._load_zip_data(btc_path, 'BTCUSDT', '1m', start_ts, end_ts)
         
-        # Debug: Check if ATR is 0 or NaN
-        if (df[self.config['atr_col_name']] <= 0).any():
-            print("[DataHandler] WARNING: Found 0 or negative ATR values! Check data quality.")
-
-        df.dropna(inplace=True)
+        if df is not None:
+            self._btc_spot_cache = df
+        
         return df
+    
+    def _load_zip_data(
+        self, 
+        base_path: str, 
+        symbol: str, 
+        timeframe: str,
+        start_ts: int, 
+        end_ts: int
+    ) -> Optional[pd.DataFrame]:
+        """
+        Load kline data from zip files.
+        
+        Args:
+            base_path: Path to the timeframe directory
+            symbol: Contract symbol
+            timeframe: Kline timeframe
+            start_ts: Start timestamp in ms
+            end_ts: End timestamp in ms
+            
+        Returns:
+            Combined DataFrame with OHLCV data
+        """
+        try:
+            # Check for date range folder structure
+            items = os.listdir(base_path)
+            date_range_folders = [d for d in items if '_' in d and 
+                                  os.path.isdir(os.path.join(base_path, d))]
+            
+            if date_range_folders:
+                # Use date range folder
+                data_folder = os.path.join(base_path, sorted(date_range_folders)[0])
+            else:
+                data_folder = base_path
+            
+            # Find all zip files
+            zip_pattern = os.path.join(data_folder, f"{symbol}-{timeframe}-*.zip")
+            zip_files = sorted(glob.glob(zip_pattern))
+            
+            if not zip_files:
+                # Try without symbol prefix
+                zip_pattern = os.path.join(data_folder, "*.zip")
+                zip_files = sorted(glob.glob(zip_pattern))
+            
+            if not zip_files:
+                return None
+            
+            # Filter zip files by date range
+            start_date = pd.to_datetime(start_ts, unit='ms').date()
+            end_date = pd.to_datetime(end_ts, unit='ms').date()
+            
+            dfs = []
+            for zip_path in zip_files:
+                # Extract date from filename
+                filename = os.path.basename(zip_path)
+                try:
+                    # Parse date from filename like "BTCUSDT-1m-2024-01-01.zip"
+                    date_parts = filename.replace('.zip', '').split('-')
+                    if len(date_parts) >= 4:
+                        file_date = pd.to_datetime('-'.join(date_parts[-3:])).date()
+                    else:
+                        continue
+                    
+                    # Skip if outside date range
+                    if file_date < start_date or file_date > end_date:
+                        continue
+                    
+                    # Load data from zip
+                    df_temp = self._read_zip_file(zip_path)
+                    if df_temp is not None:
+                        dfs.append(df_temp)
+                        
+                except Exception as e:
+                    continue
+            
+            if not dfs:
+                return None
+            
+            # Combine all dataframes
+            df = pd.concat(dfs, ignore_index=True)
+            
+            # Process timestamps
+            df['timestamp'] = pd.to_datetime(df['open_time'], unit='ms')
+            
+            # Select and clean columns
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            
+            # Filter to exact time range
+            mask = (df['timestamp'] >= pd.to_datetime(start_ts, unit='ms')) & \
+                   (df['timestamp'] <= pd.to_datetime(end_ts, unit='ms'))
+            df = df.loc[mask]
+            
+            # Clean up
+            df.drop_duplicates(subset='timestamp', inplace=True)
+            df.sort_values('timestamp', inplace=True)
+            df.set_index('timestamp', inplace=True)
+            df = df.astype(float)
+            
+            return df
+            
+        except Exception as e:
+            print(f"[DataHandler] Error loading data for {symbol}: {e}")
+            return None
+    
+    def _read_zip_file(self, zip_path: str) -> Optional[pd.DataFrame]:
+        """Read CSV data from a zip file."""
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
+                if not csv_files:
+                    return None
+                
+                with zf.open(csv_files[0]) as csv_file:
+                    df = pd.read_csv(csv_file, header=None, names=[
+                        'open_time', 'open', 'high', 'low', 'close', 'volume',
+                        'close_time', 'quote_asset_volume', 'number_of_trades',
+                        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+                    ])
+                    
+                    # Handle microseconds timestamps (2025+ data)
+                    if df['open_time'].iloc[0] > 1e15:
+                        df['open_time'] = df['open_time'] // 1000
+                    
+                    return df
+                    
+        except Exception as e:
+            return None
+    
+    def prepare_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add technical indicators needed for the meme strategy.
+        
+        Args:
+            df: DataFrame with OHLCV data
+            
+        Returns:
+            DataFrame with added indicator columns
+        """
+        if df is None or df.empty:
+            return df
+        
+        df = df.copy()
+        
+        # Bollinger Bands for volatility breakout
+        bb_length = self.config['bb_length']
+        bb_std = self.config['bb_std']
+        
+        bbands = df.ta.bbands(
+            close=df['close'],
+            length=bb_length,
+            std=bb_std
+        )
+        
+        if bbands is not None:
+            # Find the upper band column
+            upper_col = [c for c in bbands.columns if c.startswith('BBU')][0]
+            df['bb_upper'] = bbands[upper_col]
+        
+        # Volume MA for confirmation
+        vol_ma_length = self.config['volume_ma_length']
+        df['volume_ma'] = df['volume'].rolling(window=vol_ma_length).mean()
+        
+        return df
+    
+    def calculate_hourly_change(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
+        """
+        Calculate the 1-hour price change for a symbol.
+        
+        Args:
+            df: DataFrame with 1m OHLCV data
+            current_time: Current timestamp
+            
+        Returns:
+            1-hour percentage change (e.g., 0.05 for 5%)
+        """
+        if df is None or df.empty:
+            return 0.0
+        
+        try:
+            one_hour_ago = current_time - pd.Timedelta(hours=1)
+            
+            # Get price 1 hour ago
+            mask = df.index <= one_hour_ago
+            if not mask.any():
+                return 0.0
+            
+            price_1h_ago = df.loc[mask, 'close'].iloc[-1]
+            
+            # Get current price
+            mask_current = df.index <= current_time
+            if not mask_current.any():
+                return 0.0
+            
+            current_price = df.loc[mask_current, 'close'].iloc[-1]
+            
+            return (current_price - price_1h_ago) / price_1h_ago
+            
+        except Exception:
+            return 0.0
+    
+    def calculate_24h_change(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
+        """
+        Calculate the 24-hour price change for a symbol.
+        
+        Args:
+            df: DataFrame with 1m OHLCV data
+            current_time: Current timestamp
+            
+        Returns:
+            24-hour percentage change
+        """
+        if df is None or df.empty:
+            return 0.0
+        
+        try:
+            one_day_ago = current_time - pd.Timedelta(hours=24)
+            
+            mask = df.index <= one_day_ago
+            if not mask.any():
+                return 0.0
+            
+            price_24h_ago = df.loc[mask, 'close'].iloc[-1]
+            
+            mask_current = df.index <= current_time
+            if not mask_current.any():
+                return 0.0
+            
+            current_price = df.loc[mask_current, 'close'].iloc[-1]
+            
+            return (current_price - price_24h_ago) / price_24h_ago
+            
+        except Exception:
+            return 0.0
+    
+    def get_lowest_low(self, df: pd.DataFrame, current_time: pd.Timestamp, lookback: int, exclude_last: int = 1) -> float:
+        """
+        Get the lowest low of the last N candles (excluding the most recent candles).
+        
+        For structural exit, we compare prev_bar's close against lowest_low of 
+        the 20 candles BEFORE prev_bar, so we need to exclude the last candle 
+        from the lookback window.
+        
+        Args:
+            df: DataFrame with OHLCV data
+            current_time: Current timestamp
+            lookback: Number of candles to look back
+            exclude_last: Number of most recent candles to exclude (default 1)
+            
+        Returns:
+            Lowest low price
+        """
+        if df is None or df.empty:
+            return 0.0
+        
+        try:
+            mask = df.index < current_time
+            available_data = df.loc[mask]
+            
+            if len(available_data) <= exclude_last:
+                return 0.0
+            
+            # Exclude the last N candles and then take the lookback period
+            recent_data = available_data.iloc[:-exclude_last].tail(lookback)
+            
+            if recent_data.empty:
+                return 0.0
+            
+            return recent_data['low'].min()
+            
+        except Exception:
+            return 0.0
+    
+    def clear_cache(self):
+        """Clear all cached data."""
+        self._data_cache.clear()
+        self._btc_spot_cache = None

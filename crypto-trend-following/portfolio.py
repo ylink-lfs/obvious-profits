@@ -1,149 +1,237 @@
 # portfolio.py
-# [MODIFIED] Fixed AttributeError by changing bar.Index to bar.name
+# Meme Coin Strategy Portfolio Management
+# Handles position sizing, trade execution, and PnL tracking
 
-import numpy as np
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass
+import pandas as pd
 
-class Portfolio:
+
+@dataclass
+class Trade:
+    """Completed trade record."""
+    symbol: str
+    entry_time: pd.Timestamp
+    exit_time: pd.Timestamp
+    entry_price: float
+    exit_price: float
+    size_usd: float
+    size_units: float
+    pnl_usd: float
+    pnl_pct: float
+    exit_reason: str
+    fees_paid: float
+
+
+class MemePortfolio:
     """
-    Handles all capital, risk, and position management.
-    [MODIFIED] Adapted for MA/MACD Strategy (Long/Short/Flat).
+    Portfolio manager for meme coin strategy.
+    
+    Features:
+    - Fixed position sizing (500 USD per trade)
+    - Fee and slippage handling
+    - Trade logging and balance tracking
     """
+    
     def __init__(self, config):
-        print("[Portfolio] Initializing Portfolio...")
+        print("[Portfolio] Initializing MemePortfolio...")
         self.config = config
-        self.balance = self.config['initial_capital']
-        self.risk_pct = self.config['risk_per_trade_percent']
         
-        # State: 0 = FLAT, 1 = LONG, -1 = SHORT
-        self.state = 0
-        self.trade_type = None
+        self.initial_capital = config['initial_capital']
+        self.position_size_usd = config['position_size_usd']
+        self.fee_rate = config['fee_rate']
+        self.slippage_rate = config['slippage_rate']
         
-        self.position_size = 0.0
-        self.entry_price = 0.0
-        self.stop_loss_price = 0.0
+        # Current state
+        self.balance = self.initial_capital
+        self.positions: Dict[str, Any] = {}  # symbol -> Position
         
-        self.trades_log = []
-        self.balance_history = []
-
-    def check_for_exit(self, bar, fee_pct=0.001):
+        # History
+        self.trades_log: List[Trade] = []
+        self.balance_history: List[Dict] = []
+    
+    def can_open_position(self) -> bool:
+        """Check if we have enough capital for a new position."""
+        return self.balance >= self.position_size_usd
+    
+    def has_position(self, symbol: str) -> bool:
+        """Check if we have an open position for this symbol."""
+        return symbol in self.positions
+    
+    def get_position(self, symbol: str) -> Optional[Any]:
+        """Get position for a symbol if exists."""
+        return self.positions.get(symbol)
+    
+    def open_position(
+        self,
+        symbol: str,
+        entry_price: float,
+        entry_time: pd.Timestamp
+    ) -> bool:
         """
-        Checks exit conditions (SL) for an open position.
-        Strategy exits (like Price < MA) are handled by the strategy logic itself.
-        """
-        if self.state == 0:
-            return False
-
-        # Universal Exit: Stop Loss
-        # For Long: Low <= SL
-        if self.state == 1:
-            if bar.low <= self.stop_loss_price:
-                self._execute_exit(bar, self.stop_loss_price, 'StopLoss', fee_pct)
-                return True
+        Open a new position.
         
-        # For Short: High >= SL
-        elif self.state == -1:
-            if bar.high >= self.stop_loss_price:
-                self._execute_exit(bar, self.stop_loss_price, 'StopLoss', fee_pct)
-                return True
+        Args:
+            symbol: Contract symbol
+            entry_price: Entry price (already includes slippage)
+            entry_time: Entry timestamp
             
-        return False
+        Returns:
+            True if position was opened successfully
+        """
+        if not self.can_open_position():
+            print("[Portfolio] Cannot open position: insufficient balance")
+            return False
         
-    def _execute_exit(self, bar, exit_price, reason, fee_pct):
-        """ Internal function to close a position and log the trade. """
+        if self.has_position(symbol):
+            print(f"[Portfolio] Cannot open position: already have {symbol}")
+            return False
+        
+        # Calculate position size
+        size_usd = self.position_size_usd
+        size_units = size_usd / entry_price
+        
+        # Deduct entry fee and position capital from balance
+        entry_fee = size_usd * self.fee_rate
+        self.balance -= size_usd  # Lock the capital for the position
+        
+        # Create position
+        from strategy.meme_momentum import Position
+        position = Position(
+            symbol=symbol,
+            entry_price=entry_price,
+            entry_time=entry_time,
+            size_usd=size_usd,
+            size_units=size_units
+        )
+        
+        self.positions[symbol] = position
+        
+        print("--- [TRADE OPENED] ---")
+        print(f"     Symbol: {symbol}")
+        print(f"     Time: {entry_time}")
+        print(f"     Price: {entry_price:.6f}")
+        print(f"     Size: {size_units:.4f} units (${size_usd})")
+        print(f"     Fee: ${entry_fee:.4f}")
+        
+        return True
+    
+    def close_position(
+        self,
+        symbol: str,
+        exit_price: float,
+        exit_time: pd.Timestamp,
+        exit_reason: str
+    ) -> Optional[Trade]:
+        """
+        Close an existing position.
+        
+        Args:
+            symbol: Contract symbol
+            exit_price: Exit price (already includes slippage)
+            exit_time: Exit timestamp
+            exit_reason: Reason for exit
+            
+        Returns:
+            Trade record if successful, None otherwise
+        """
+        if not self.has_position(symbol):
+            return None
+        
+        position = self.positions[symbol]
         
         # Calculate PnL
-        if self.state == 1: # Long
-            profit_amt = self.position_size * (exit_price - self.entry_price)
-            entry_cost = self.position_size * self.entry_price
-            exit_value = self.position_size * exit_price
-        elif self.state == -1: # Short
-            profit_amt = self.position_size * (self.entry_price - exit_price)
-            entry_cost = self.position_size * self.entry_price
-            exit_value = self.position_size * exit_price
-        else:
-            return
-
-        # Apply fees
-        total_fees = (entry_cost * fee_pct) + (exit_value * fee_pct)
-        net_profit_amt = profit_amt - total_fees
-        net_profit_pct = (net_profit_amt / entry_cost) * 100 
+        price_change = exit_price - position.entry_price
+        gross_pnl = position.size_units * price_change
         
-        self.balance += net_profit_amt
+        # Calculate fees (entry + exit)
+        entry_value = position.size_usd
+        exit_value = position.size_units * exit_price
+        total_fees = (entry_value * self.fee_rate) + (exit_value * self.fee_rate)
         
-        # [FIX] Use bar.name instead of bar.Index
-        print(f"--- [TRADE CLOSED] ---")
-        print(f"     Time: {bar.name}") 
-        print(f"     Type: {self.trade_type}")
-        print(f"     Reason: {reason}")
-        print(f"     Net Pct: {net_profit_pct:.2f}%")
-        print(f"     Balance: {self.balance:.2f}")
+        # Net PnL
+        net_pnl = gross_pnl - total_fees
+        pnl_pct = (net_pnl / position.size_usd) * 100
         
-        self.trades_log.append({
-            'entry_price': self.entry_price,
-            'exit_price': exit_price,
-            'net_profit_pct': net_profit_pct,
-            'exit_reason': reason,
-            'type': self.trade_type
-        })
+        # Update balance: add back the locked capital plus net PnL
+        self.balance += position.size_usd + net_pnl
         
-        self.state = 0
-        self.trade_type = None
-        self.position_size = 0.0
-        self.entry_price = 0.0
-        self.stop_loss_price = 0.0
-
-    def handle_entry_signal(self, bar, signal_type, entry_price, stop_loss_price, trade_type):
+        # Create trade record
+        trade = Trade(
+            symbol=symbol,
+            entry_time=position.entry_time,
+            exit_time=exit_time,
+            entry_price=position.entry_price,
+            exit_price=exit_price,
+            size_usd=position.size_usd,
+            size_units=position.size_units,
+            pnl_usd=net_pnl,
+            pnl_pct=pnl_pct,
+            exit_reason=exit_reason,
+            fees_paid=total_fees
+        )
+        
+        self.trades_log.append(trade)
+        
+        # Remove position
+        del self.positions[symbol]
+        
+        print("--- [TRADE CLOSED] ---")
+        print(f"     Symbol: {symbol}")
+        print(f"     Time: {exit_time}")
+        print(f"     Reason: {exit_reason}")
+        print(f"     Entry: {position.entry_price:.6f}")
+        print(f"     Exit: {exit_price:.6f}")
+        print(f"     PnL: ${net_pnl:.2f} ({pnl_pct:.2f}%)")
+        print(f"     Balance: ${self.balance:.2f}")
+        
+        return trade
+    
+    def update_balance_history(self, timestamp: pd.Timestamp, current_prices: Dict[str, float]):
         """
-        Calculates position size and executes a new entry.
+        Update balance history with current equity (including unrealized PnL).
+        
+        Args:
+            timestamp: Current timestamp
+            current_prices: Dict of symbol -> current price
         """
-        if self.state != 0:
-            return 
-
-        # 1. Calculate Risk Per Unit
-        if signal_type == 'BUY':
-            risk_per_unit = entry_price - stop_loss_price
-        elif signal_type == 'SELL':
-            risk_per_unit = stop_loss_price - entry_price
-        else:
-            return
-
-        if risk_per_unit <= 0:
-            # [FIX] Use bar.name
-            print(f"[Portfolio] WARNING: Invalid risk (SL check failed) at {bar.name}. Skipping.")
-            return
-
-        # 2. Calculate Position Size
-        risk_per_trade_amount = self.balance * self.risk_pct
-        position_size = risk_per_trade_amount / risk_per_unit
+        equity = self.balance
         
-        self.state = 1 if signal_type == 'BUY' else -1
-        self.trade_type = trade_type
-        self.position_size = position_size
-        self.entry_price = entry_price
-        self.stop_loss_price = stop_loss_price
+        # Add current value of open positions (capital is already deducted from balance)
+        for symbol, position in self.positions.items():
+            if symbol in current_prices:
+                current_price = current_prices[symbol]
+                # Position value at current price
+                current_value = position.size_units * current_price
+                equity += current_value
+            else:
+                # If no current price, use entry value
+                equity += position.size_usd
         
-        # [FIX] Use bar.name
-        print(f"--- [TRADE OPENED] ---")
-        print(f"     Time: {bar.name}")
-        print(f"     Type: {trade_type} ({signal_type})")
-        print(f"     Size: {position_size:.4f}")
-        print(f"    Entry: {entry_price:.2f}")
-        print(f"       SL: {stop_loss_price:.2f}")
-
-    def update_balance_history(self, bar):
-        """ Updates the equity curve at each bar. """
-        current_equity = self.balance
-        
-        # Mark-to-market valuation for open positions
-        if self.state == 1: # Long
-            unrealized_profit = self.position_size * (bar.close - self.entry_price)
-            current_equity += unrealized_profit
-        elif self.state == -1: # Short
-            unrealized_profit = self.position_size * (self.entry_price - bar.close)
-            current_equity += unrealized_profit
-        
-        # [FIX] Use bar.name for Series index
         self.balance_history.append({
-            'timestamp': bar.name, 
-            'balance': current_equity
+            'timestamp': timestamp,
+            'balance': equity,
+            'open_positions': len(self.positions)
         })
+    
+    def get_summary(self) -> Dict:
+        """Get portfolio summary statistics."""
+        if not self.trades_log:
+            return {
+                'total_trades': 0,
+                'win_rate': 0,
+                'total_pnl': 0,
+                'final_balance': self.balance
+            }
+        
+        wins = sum(1 for t in self.trades_log if t.pnl_usd > 0)
+        total = len(self.trades_log)
+        total_pnl = sum(t.pnl_usd for t in self.trades_log)
+        
+        return {
+            'total_trades': total,
+            'win_rate': (wins / total) * 100,
+            'total_pnl': total_pnl,
+            'final_balance': self.balance,
+            'return_pct': ((self.balance - self.initial_capital) / self.initial_capital) * 100
+        }
