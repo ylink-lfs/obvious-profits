@@ -75,18 +75,22 @@ class PositionManager:
         self.algo.log(f"Short call for {symbol}: Strike {short_data['strike']:.2f}, "
                      f"Delta {short_data['delta']:.2f}, Bid Premium {short_premium:.2f}")
         
+        # Calculate max allowed debit based on portfolio value
+        max_debit = self.algo.portfolio.total_portfolio_value * config.MAX_DEBIT_PCT
+        
         # Find long call (OTM, delta <= 0.25, delta >= 0.10)
         long_result = self.executor.find_long_call(
             chain, expiration, current_price,
             config.LONG_CALL_MAX_DELTA, config.LONG_CALL_MIN_DELTA,
-            short_premium, config.LONG_CALL_INITIAL_QUANTITY
+            short_premium, config.LONG_CALL_INITIAL_QUANTITY,
+            max_debit
         )
         
         if not long_result:
             self.algo.log(f"No suitable long call found for {symbol} - skipping entry")
             return False
         
-        long_call_symbol, long_data, long_quantity = long_result
+        long_call_symbol, long_data, long_quantity, net_credit = long_result
         # Use ask price for long leg (buying)
         long_premium = long_data.get("ask_price", self.executor.get_ask_price(long_data))
         
@@ -96,12 +100,14 @@ class PositionManager:
         # Calculate total cost and verify capital constraint
         total_long_cost = long_quantity * long_premium * 100
         total_short_premium = short_premium * 100
-        net_cost = total_long_cost - total_short_premium
         
-        # The spread should be a credit or minimal debit
-        if net_cost > available_capital:
-            self.algo.log(f"Insufficient capital for {symbol}: Need {net_cost:.2f}, Have {available_capital:.2f}")
-            return False
+        # If net_credit is negative (debit), check if we have enough capital
+        # net_credit is already validated against max_debit in find_long_call
+        if net_credit < 0:
+            required_capital = abs(net_credit)
+            if required_capital > available_capital:
+                self.algo.log(f"Insufficient capital for {symbol}: Need ${required_capital:.2f}, Have ${available_capital:.2f}")
+                return False
         
         # Add contracts and place orders
         self.executor.add_contract_with_fee(long_call_symbol)
@@ -135,7 +141,7 @@ class PositionManager:
         self.algo.log(f"Entered squeeze spread for {symbol}: "
                      f"Long {long_quantity}x {long_data['strike']:.2f}C @ {long_order_price:.2f}, "
                      f"Short 1x {short_data['strike']:.2f}C @ {short_order_price:.2f}, "
-                     f"Net: ${net_cost:.2f}")
+                     f"Net Credit: ${net_credit:.2f} {'(credit)' if net_credit >= 0 else '(debit)'}")
         
         return True
     

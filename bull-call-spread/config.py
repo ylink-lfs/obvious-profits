@@ -5,11 +5,33 @@ START_DATE = (2023, 1, 1)
 END_DATE = (2024, 3, 31)
 INITIAL_CAPITAL = 15000
 
-# Symbol pool
-SYMBOL_POOL = ["TQQQ", "SOXL", "NVDA", "TSLA", "MSTR", "COIN"]
+# ==================== Universe Selection ====================
+
+# Enable dynamic universe selection (False = use fixed SYMBOL_POOL)
+DYNAMIC_UNIVERSE_SELECTION = True
+
+# Fixed symbol pool (used when DYNAMIC_UNIVERSE_SELECTION = False)
+SYMBOL_POOL = ["MARA", "PLTR", "SOFI", "DKNG", "SOXL"]
+
+# Coarse selection parameters
+SELECTION_MIN_PRICE = 10      # Min stock price to avoid penny stocks
+SELECTION_MAX_PRICE = 100     # Max price for $15k account (manageable option premiums)
+SELECTION_MIN_VOLUME = 50_000_000  # Min daily dollar volume ($50M)
+COARSE_SELECTION_COUNT = 100  # Take top 100 by volume from coarse filter
+
+# Beta calculation parameters (used in Math-Only selection)
+SELECTION_MIN_BETA = 1.0      # Require Beta > 1.0 (high-beta stocks)
+BETA_LOOKBACK_DAYS = 90       # 90-day lookback for beta calculation
+
+# Final selection parameters
+FINAL_SELECTION_COUNT = 5     # Max number of symbols to track after all filters
+
+# Selection frequency
+SELECTION_INTERVAL_DAYS = 7   # Re-run full universe selection every N days
 
 # Capital allocation
 MAX_POSITION_PCT = 0.15  # Max 15% of total capital per entry
+MAX_DEBIT_PCT = 0.02  # Max 2% of total capital allowed as net debit for spread
 
 # ==================== Entry Signals ====================
 
@@ -48,12 +70,12 @@ MONTHLY_OPTIONS_ONLY = True  # Use nearest monthly options
 # Long Call parameters (OTM)
 LONG_CALL_INITIAL_QUANTITY = 2  # Start with 2 OTM calls
 LONG_CALL_MAX_QUANTITY = 3  # Can increase to 3 if needed
-LONG_CALL_MAX_DELTA = 0.25  # Delta <= 0.25
+LONG_CALL_MAX_DELTA = 0.3  # Delta <= 0.3
 LONG_CALL_MIN_DELTA = 0.10  # Skip entry if delta drops below 0.10
 
 # Short Call parameters (ITM/ATM)
 SHORT_CALL_QUANTITY = 1  # 1 ITM or ATM call
-SHORT_CALL_MIN_DELTA = 0.60  # Delta >= 0.60
+SHORT_CALL_MIN_DELTA = 0.50  # Delta >= 0.50
 
 # ==================== Exit Signals ====================
 

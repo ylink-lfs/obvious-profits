@@ -9,6 +9,7 @@ from models import CustomOptionFeeModel, SymbolData, EntryCandidate
 from signals import SignalGenerator
 from execution import OrderExecutor
 from positions import PositionManager
+from universe import CoiledSpringUniverseSelection, ManualUniverseSelection
 # endregion
 
 
@@ -56,8 +57,18 @@ class SqueezeEntryOptionsStrategy(QCAlgorithm):
             config.PLATFORM_FEE_PER_ORDER
         )
         
-        # Add equities and options for each symbol in the pool
-        self._initialize_symbols()
+        # Initialize universe selection
+        if config.DYNAMIC_UNIVERSE_SELECTION:
+            # Dynamic selection using full market scan with Math-Only approach
+            self.universe_selector = CoiledSpringUniverseSelection(self)
+            # Add coarse universe selection - pass function directly to add_universe
+            self.add_universe(self._coarse_selection_filter)
+            self.log("Using DYNAMIC universe selection (Coiled Spring - Math Only)")
+        else:
+            # Manual selection using fixed symbol pool
+            self.universe_selector = ManualUniverseSelection(self, config.SYMBOL_POOL)
+            self._initialize_symbols(config.SYMBOL_POOL)
+            self.log(f"Using MANUAL universe selection with {len(config.SYMBOL_POOL)} symbols")
         
         # Initialize components
         self.signal_gen = SignalGenerator(self)
@@ -70,39 +81,50 @@ class SqueezeEntryOptionsStrategy(QCAlgorithm):
         # Warm up period
         self.set_warm_up(config.WARM_UP_PERIOD, Resolution.DAILY)
     
-    def _initialize_symbols(self):
-        """Initialize all symbols in the pool with indicators."""
-        for symbol_str in config.SYMBOL_POOL:
-            # Add equity
-            equity = self.add_equity(symbol_str, Resolution.DAILY)
-            equity.set_data_normalization_mode(DataNormalizationMode.RAW)
-            
-            # Add options
-            option = self.add_option(symbol_str, Resolution.DAILY)
-            option.set_filter(self._option_filter)
-            
-            # Create symbol data object
-            data = SymbolData(symbol=symbol_str)
-            data.equity_symbol = equity.symbol
-            data.option_symbol = option.symbol
-            
-            # Initialize indicators
-            data.rsi = self.rsi(equity.symbol, config.RSI_PERIOD, 
-                               MovingAverageType.WILDERS, Resolution.DAILY)
-            data.sma20 = self.sma(equity.symbol, config.BB_PERIOD, Resolution.DAILY)
-            data.sma200 = self.sma(equity.symbol, config.MA200_PERIOD, Resolution.DAILY)
-            data.bb = self.bb(equity.symbol, config.BB_PERIOD, config.BB_STD, 
-                             MovingAverageType.SIMPLE, Resolution.DAILY)
-            data.atr_short = self.atr(equity.symbol, config.ATR_SHORT_PERIOD, 
-                                      MovingAverageType.SIMPLE, Resolution.DAILY)
-            data.atr_long = self.atr(equity.symbol, config.ATR_LONG_PERIOD,
-                                     MovingAverageType.SIMPLE, Resolution.DAILY)
-            
-            # Apply custom fee model to options
-            option.set_fee_model(self.custom_fee_model)
-            
-            self.symbol_data[symbol_str] = data
-            self.log(f"Initialized {symbol_str} with indicators")
+    def _coarse_selection_filter(self, coarse: List) -> List[Symbol]:
+        """Callback for coarse universe selection - delegates to universe selector."""
+        return self.universe_selector.select_coarse(coarse)
+    
+    def _initialize_symbols(self, symbol_list: List[str]):
+        """Initialize symbols with indicators."""
+        for symbol_str in symbol_list:
+            self._add_symbol(symbol_str)
+    
+    def _add_symbol(self, symbol_str: str):
+        """Add a single symbol with equity, options, and indicators."""
+        if symbol_str in self.symbol_data:
+            return  # Already initialized
+        
+        # Add equity
+        equity = self.add_equity(symbol_str, Resolution.DAILY)
+        equity.set_data_normalization_mode(DataNormalizationMode.RAW)
+        
+        # Add options
+        option = self.add_option(symbol_str, Resolution.DAILY)
+        option.set_filter(self._option_filter)
+        
+        # Create symbol data object
+        data = SymbolData(symbol=symbol_str)
+        data.equity_symbol = equity.symbol
+        data.option_symbol = option.symbol
+        
+        # Initialize indicators
+        data.rsi = self.rsi(equity.symbol, config.RSI_PERIOD, 
+                           MovingAverageType.WILDERS, Resolution.DAILY)
+        data.sma20 = self.sma(equity.symbol, config.BB_PERIOD, Resolution.DAILY)
+        data.sma200 = self.sma(equity.symbol, config.MA200_PERIOD, Resolution.DAILY)
+        data.bb = self.bb(equity.symbol, config.BB_PERIOD, config.BB_STD, 
+                         MovingAverageType.SIMPLE, Resolution.DAILY)
+        data.atr_short = self.atr(equity.symbol, config.ATR_SHORT_PERIOD, 
+                                  MovingAverageType.SIMPLE, Resolution.DAILY)
+        data.atr_long = self.atr(equity.symbol, config.ATR_LONG_PERIOD,
+                                 MovingAverageType.SIMPLE, Resolution.DAILY)
+        
+        # Apply custom fee model to options
+        option.set_fee_model(self.custom_fee_model)
+        
+        self.symbol_data[symbol_str] = data
+        self.log(f"Initialized {symbol_str} with indicators")
     
     def _option_filter(self, universe: OptionFilterUniverse) -> OptionFilterUniverse:
         """Filter options to relevant strikes and expirations."""
@@ -110,6 +132,9 @@ class SqueezeEntryOptionsStrategy(QCAlgorithm):
     
     def _schedule_events(self):
         """Schedule all daily events."""
+        # Use SPY as reference for scheduling (always available)
+        reference_symbol = "SPY"
+        
         # Record previous day data before market open
         self.schedule.on(
             self.date_rules.every_day(),
@@ -120,21 +145,21 @@ class SqueezeEntryOptionsStrategy(QCAlgorithm):
         # Main strategy check after market open
         self.schedule.on(
             self.date_rules.every_day(),
-            self.time_rules.after_market_open(config.SYMBOL_POOL[0], 30),
+            self.time_rules.after_market_open(reference_symbol, 30),
             self._daily_strategy_check
         )
         
         # Process pending orders
         self.schedule.on(
             self.date_rules.every_day(),
-            self.time_rules.after_market_open(config.SYMBOL_POOL[0], 60),
+            self.time_rules.after_market_open(reference_symbol, 60),
             self.executor.process_pending_orders
         )
         
         # Update BB width and IV history at end of day
         self.schedule.on(
             self.date_rules.every_day(),
-            self.time_rules.before_market_close(config.SYMBOL_POOL[0], 5),
+            self.time_rules.before_market_close(reference_symbol, 5),
             self._update_daily_history
         )
     
@@ -340,6 +365,26 @@ class SqueezeEntryOptionsStrategy(QCAlgorithm):
             if success:
                 # Only enter one position at a time
                 break
+    
+    def on_securities_changed(self, changes: SecurityChanges):
+        """Handle securities added/removed from the universe."""
+        # Only relevant for dynamic universe selection
+        if not config.DYNAMIC_UNIVERSE_SELECTION:
+            return
+        
+        # Add new securities
+        for security in changes.added_securities:
+            if security.type == SecurityType.EQUITY:
+                symbol_str = security.symbol.value
+                if symbol_str not in self.symbol_data:
+                    self._add_symbol(symbol_str)
+                    self.log(f"Universe Added: {symbol_str}")
+        
+        # Log removed securities (don't remove data immediately to handle exits)
+        for security in changes.removed_securities:
+            if security.type == SecurityType.EQUITY:
+                symbol_str = security.symbol.value
+                self.log(f"Universe Removed: {symbol_str}")
     
     def on_data(self, data: Slice):
         """Handle incoming data."""

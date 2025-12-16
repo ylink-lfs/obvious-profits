@@ -158,18 +158,22 @@ class OrderExecutor:
     
     def find_long_call(self, chain, expiration, current_price: float,
                        max_delta: float, min_delta: float,
-                       short_premium: float, quantity: int) -> Optional[Tuple]:
+                       short_premium: float, quantity: int,
+                       max_debit: float = 0.0) -> Optional[Tuple]:
         """
         Find a long call (OTM) with delta <= max_delta and delta >= min_delta.
         
         The selected call should satisfy:
-        - quantity * long_ask_price <= short_bid_price (premium received covers cost)
+        - Net credit >= -max_debit (i.e., short_bid - quantity * long_ask >= -max_debit)
+        
+        If max_debit is 0, requires a net credit (short premium covers long cost).
+        If max_debit > 0, allows a small net debit up to that amount.
         
         Uses ask price for long leg (buying) to be conservative.
         
         If not found, move strike up until condition is met or delta < min_delta.
         
-        Returns (contract_symbol, contract_data, final_quantity) or None
+        Returns (contract_symbol, contract_data, final_quantity, net_credit) or None
         """
         if not chain:
             return None
@@ -207,9 +211,13 @@ class OrderExecutor:
             if ask_price <= 0:
                 continue
             
-            # Check if short premium (bid) covers long premium cost (ask)
+            # Calculate net credit: short premium - long cost
+            # Positive = credit spread, Negative = debit spread
             total_long_cost = quantity * ask_price * 100
-            if total_long_cost <= short_premium * 100:
+            net_credit = short_premium * 100 - total_long_cost
+            
+            # Allow if net credit >= -max_debit (accept small debits up to threshold)
+            if net_credit >= -max_debit:
                 return (c.symbol, {
                     "bid": c.bid_price,
                     "ask": c.ask_price,
@@ -217,7 +225,7 @@ class OrderExecutor:
                     "strike": c.strike,
                     "delta": delta,
                     "ask_price": ask_price  # Use ask price for order
-                }, quantity)
+                }, quantity, net_credit)
         
         # If 2 contracts don't work, try with 3 contracts at higher strikes
         if quantity == 2:
@@ -231,7 +239,9 @@ class OrderExecutor:
                 
                 # Try with 3 contracts
                 total_long_cost = 3 * ask_price * 100
-                if total_long_cost <= short_premium * 100:
+                net_credit = short_premium * 100 - total_long_cost
+                
+                if net_credit >= -max_debit:
                     return (c.symbol, {
                         "bid": c.bid_price,
                         "ask": c.ask_price,
@@ -239,7 +249,7 @@ class OrderExecutor:
                         "strike": c.strike,
                         "delta": delta,
                         "ask_price": ask_price  # Use ask price for order
-                    }, 3)
+                    }, 3, net_credit)
         
         return None
     
