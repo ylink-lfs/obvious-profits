@@ -22,8 +22,12 @@ CONFIG = {
     'timeframe': '1m',  # Primary timeframe for entry/exit
     
     # --- Universe Filters ---
-    # Stablecoins to exclude
-    'excluded_stablecoins': ['USDC', 'TUSD', 'FDUSD', 'BUSD', 'DAI', 'USDD', 'USDP'],
+    # Valid quote assets (only pairs ending with these will be included)
+    'valid_quote_assets': ['USDT', 'BUSD', 'USDC'],
+    # Non-crypto assets to exclude (e.g., gold, silver)
+    'excluded_non_crypto': ['XAU', 'XAG'],
+    # Stablecoins to exclude (including zombie stablecoins like USTC)
+    'excluded_stablecoins': ['USDC', 'TUSD', 'FDUSD', 'BUSD', 'DAI', 'USDD', 'USDP', 'USTC', 'USDE', 'PYUSD', 'EURI'],
     # Index contracts to exclude
     'excluded_indices': ['BTCDOM', 'DEFI', 'FOOTBALL', 'BLUEBIRD'],
     # Low volatility giants to exclude

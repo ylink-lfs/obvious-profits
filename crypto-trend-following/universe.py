@@ -2,6 +2,7 @@
 # Contract Universe Management - Discovers contracts and manages the trading universe
 
 import os
+import re
 import json
 import zipfile
 import pandas as pd
@@ -150,6 +151,22 @@ class UniverseFilter:
     
     def _setup_default_filters(self):
         """Setup default filters from config."""
+        # Non-USDT pair filter (must come first to filter out ETHBTC etc.)
+        self.filters.append(
+            USDTPairFilter(self.config.get('valid_quote_assets', ['USDT', 'BUSD', 'USDC']))
+        )
+        # Delivery/Quarterly contract filter (filter out BTCUSDT_210326 etc.)
+        self.filters.append(
+            DeliveryContractFilter()
+        )
+        # Settled contract filter (filter out AERGOUSDTSETTLED etc.)
+        self.filters.append(
+            SettledContractFilter()
+        )
+        # Non-crypto asset filter (filter out XAUUSDT etc.)
+        self.filters.append(
+            NonCryptoAssetFilter(self.config.get('excluded_non_crypto', ['XAU', 'XAG']))
+        )
         # Stablecoin filter
         self.filters.append(
             StablecoinFilter(self.config['excluded_stablecoins'])
@@ -198,9 +215,15 @@ class StablecoinFilter:
         return [s for s in symbols if not self._is_stablecoin(s)]
     
     def _is_stablecoin(self, symbol: str) -> bool:
-        # Remove USDT suffix and check if base is a stablecoin
-        base = symbol.replace('USDT', '').replace('BUSD', '').replace('USDC', '')
+        base = self._get_base_symbol(symbol)
         return base in self.excluded or symbol in self.excluded
+    
+    def _get_base_symbol(self, symbol: str) -> str:
+        """Extract base symbol using regex for robust parsing."""
+        match = re.match(r'^(.*?)(USDT|BUSD|USDC)$', symbol)
+        if match:
+            return match.group(1)
+        return symbol
 
 
 class IndexFilter:
@@ -213,8 +236,15 @@ class IndexFilter:
         return [s for s in symbols if not self._is_index(s)]
     
     def _is_index(self, symbol: str) -> bool:
-        base = symbol.replace('USDT', '').replace('BUSD', '')
+        base = self._get_base_symbol(symbol)
         return base in self.excluded
+    
+    def _get_base_symbol(self, symbol: str) -> str:
+        """Extract base symbol using regex for robust parsing."""
+        match = re.match(r'^(.*?)(USDT|BUSD|USDC)$', symbol)
+        if match:
+            return match.group(1)
+        return symbol
 
 
 class GiantFilter:
@@ -227,8 +257,83 @@ class GiantFilter:
         return [s for s in symbols if not self._is_giant(s)]
     
     def _is_giant(self, symbol: str) -> bool:
-        base = symbol.replace('USDT', '').replace('BUSD', '')
+        base = self._get_base_symbol(symbol)
         return base in self.excluded
+    
+    def _get_base_symbol(self, symbol: str) -> str:
+        """Extract base symbol using regex for robust parsing."""
+        match = re.match(r'^(.*?)(USDT|BUSD|USDC)$', symbol)
+        if match:
+            return match.group(1)
+        return symbol
+
+
+class USDTPairFilter:
+    """
+    Filter to ensure only valid USDT/BUSD/USDC pairs are included.
+    This filters out cross pairs like ETHBTC.
+    """
+    
+    def __init__(self, valid_quotes: List[str]):
+        self.valid_quotes = set(valid_quotes)
+    
+    def filter(self, symbols: List[str]) -> List[str]:
+        return [s for s in symbols if self._is_valid_pair(s)]
+    
+    def _is_valid_pair(self, symbol: str) -> bool:
+        """Check if the symbol ends with a valid quote asset."""
+        for quote in self.valid_quotes:
+            if symbol.endswith(quote):
+                return True
+        return False
+
+
+class DeliveryContractFilter:
+    """
+    Filter out delivery/quarterly contracts.
+    These have format like BTCUSDT_210326 (dated contracts).
+    """
+    
+    def filter(self, symbols: List[str]) -> List[str]:
+        return [s for s in symbols if not self._is_delivery(s)]
+    
+    def _is_delivery(self, symbol: str) -> bool:
+        """Check if symbol is a delivery contract (contains _YYMMDD suffix)."""
+        return bool(re.search(r'_\d{6}$', symbol))
+
+
+class SettledContractFilter:
+    """
+    Filter out settled/delisted contracts.
+    These have SETTLED suffix like AERGOUSDTSETTLED.
+    """
+    
+    def filter(self, symbols: List[str]) -> List[str]:
+        return [s for s in symbols if not self._is_settled(s)]
+    
+    def _is_settled(self, symbol: str) -> bool:
+        """Check if symbol has SETTLED suffix."""
+        return symbol.endswith('SETTLED')
+
+
+class NonCryptoAssetFilter:
+    """
+    Filter out non-crypto assets like gold (XAU), silver (XAG).
+    These traditional assets shouldn't be in a meme coin strategy.
+    """
+    
+    def __init__(self, excluded_assets: List[str]):
+        self.excluded = set(excluded_assets)
+    
+    def filter(self, symbols: List[str]) -> List[str]:
+        return [s for s in symbols if not self._is_non_crypto(s)]
+    
+    def _is_non_crypto(self, symbol: str) -> bool:
+        """Check if symbol contains a non-crypto asset identifier."""
+        for asset in self.excluded:
+            if asset in symbol:
+                return True
+        return False
 
 
 class UniverseManager:
