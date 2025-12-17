@@ -30,7 +30,10 @@ CONFIG = {
     'excluded_giants': ['BTC', 'ETH'],
     
     # --- Universe Selection ---
-    'top_gainers_count': 30,  # Select top N 24h gainers
+    # Top gainers selection: Top X% of 24h gainers with min/max bounds
+    'top_gainers_pct': 0.10,  # Select top 10% of 24h gainers
+    'top_gainers_min': 5,     # Minimum number of symbols to select
+    'top_gainers_max': 20,    # Maximum number of symbols to select
     'universe_check_interval_minutes': 60,  # Check universe every 60 minutes
     
     # --- Entry Signal Parameters ---
