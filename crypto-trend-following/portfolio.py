@@ -91,8 +91,7 @@ class MemePortfolio:
         size_usd = self.position_size_usd
         size_units = size_usd / entry_price
         
-        # Deduct entry fee and position capital from balance
-        entry_fee = size_usd * self.fee_rate
+        # Deduct position capital from balance (fee is tracked separately)
         self.balance -= size_usd  # Lock the capital for the position
         
         # Create position
@@ -106,13 +105,6 @@ class MemePortfolio:
         )
         
         self.positions[symbol] = position
-        
-        print("--- [TRADE OPENED] ---")
-        print(f"     Symbol: {symbol}")
-        print(f"     Time: {entry_time}")
-        print(f"     Price: {entry_price:.6f}")
-        print(f"     Size: {size_units:.4f} units (${size_usd})")
-        print(f"     Fee: ${entry_fee:.4f}")
         
         return True
     
@@ -176,15 +168,7 @@ class MemePortfolio:
         # Remove position
         del self.positions[symbol]
         
-        print("--- [TRADE CLOSED] ---")
-        print(f"     Symbol: {symbol}")
-        print(f"     Time: {exit_time}")
-        print(f"     Reason: {exit_reason}")
-        print(f"     Entry: {position.entry_price:.6f}")
-        print(f"     Exit: {exit_price:.6f}")
-        print(f"     PnL: ${net_pnl:.2f} ({pnl_pct:.2f}%)")
-        print(f"     Balance: ${self.balance:.2f}")
-        
+
         return trade
     
     def update_balance_history(self, timestamp: pd.Timestamp, current_prices: Dict[str, float]):
@@ -221,7 +205,8 @@ class MemePortfolio:
                 'total_trades': 0,
                 'win_rate': 0,
                 'total_pnl': 0,
-                'final_balance': self.balance
+                'final_balance': self.balance,
+                'return_pct': ((self.balance - self.initial_capital) / self.initial_capital) * 100
             }
         
         wins = sum(1 for t in self.trades_log if t.pnl_usd > 0)

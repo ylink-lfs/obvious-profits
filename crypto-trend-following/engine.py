@@ -77,11 +77,21 @@ class MemeBacktestEngine:
         # 4. Main backtest loop
         print("\n[Engine] Step 4: Running backtest loop...")
         last_universe_update = None
+        total_bars = len(timeline)
+        
+        # Progress tracking
+        import time
+        start_time = time.time()
         
         for i, current_time in enumerate(timeline):
-            # Progress indicator
-            if i % 10000 == 0:
-                print(f"[Engine] Progress: {i}/{len(timeline)} bars ({current_time})")
+            # Progress indicator with percentage and speed
+            if i % 10000 == 0 and i > 0:
+                elapsed = time.time() - start_time
+                bars_per_sec = i / elapsed if elapsed > 0 else 0
+                pct = (i / total_bars) * 100
+                eta_secs = (total_bars - i) / bars_per_sec if bars_per_sec > 0 else 0
+                eta_mins = eta_secs / 60
+                print(f"[Engine] Progress: {pct:.1f}% ({i:,}/{total_bars:,}) | Speed: {bars_per_sec:,.0f} bars/s | ETA: {eta_mins:.1f} min")
             
             current_time_ms = int(current_time.value // 10**6)
             
@@ -142,15 +152,12 @@ class MemeBacktestEngine:
             return
         
         # Select top gainers
-        # Use a 24h lookback window for data
-        lookback_start = current_time_ms - (24 * 60 * 60 * 1000)
-        
+        # Use fixed backtest time range to ensure DataHandler cache hits
+        # (The calculate_24h_change function uses searchsorted internally,
+        # so it only needs data that "contains" the time point, not exact 24h slice)
         self.current_universe = self.gainer_selector.select_top_gainers(
-            available, current_time, lookback_start, current_time_ms
+            available, current_time, self.start_ts, self.end_ts
         )
-        
-        if len(self.current_universe) > 0 and len(self.current_universe) <= 5:
-            print(f"[Engine] Universe updated: {len(self.current_universe)} symbols - {self.current_universe[:5]}")
     
     def _process_symbol(
         self, 
@@ -165,15 +172,17 @@ class MemeBacktestEngine:
         if df is None or df.empty:
             return
         
-        # Get current and previous bars
-        mask = df.index <= current_time
-        available_data = df.loc[mask]
+        # Get current and previous bars using O(log N) binary search
+        # searchsorted with side='right' finds the insertion point after any existing entries
+        idx = df.index.searchsorted(current_time, side='right') - 1
         
-        if len(available_data) < 2:
+        # Need at least 2 bars (current + previous)
+        if idx < 1:
             return
         
-        current_bar = available_data.iloc[-1]
-        prev_bar = available_data.iloc[-2]
+        # Direct O(1) access by index position - no memory copy
+        current_bar = df.iloc[idx]
+        prev_bar = df.iloc[idx - 1]
         
         # Check if we have a position in this symbol
         position = self.portfolio.get_position(symbol)
@@ -232,10 +241,11 @@ class MemeBacktestEngine:
         
         for symbol in self.portfolio.positions:
             df = self.contract_data_cache.get(symbol)
-            if df is not None:
-                mask = df.index <= current_time
-                if mask.any():
-                    current_prices[symbol] = df.loc[mask, 'close'].iloc[-1]
+            if df is not None and len(df) > 0:
+                # O(log N) binary search instead of O(N) boolean mask
+                idx = df.index.searchsorted(current_time, side='right') - 1
+                if idx >= 0:
+                    current_prices[symbol] = df['close'].iloc[idx]
         
         self.portfolio.update_balance_history(current_time, current_prices)
     
@@ -245,10 +255,11 @@ class MemeBacktestEngine:
         
         for symbol in symbols_to_close:
             df = self.contract_data_cache.get(symbol)
-            if df is not None and not df.empty:
-                mask = df.index <= end_time
-                if mask.any():
-                    exit_price = df.loc[mask, 'close'].iloc[-1]
+            if df is not None and len(df) > 0:
+                # O(log N) binary search instead of O(N) boolean mask
+                idx = df.index.searchsorted(end_time, side='right') - 1
+                if idx >= 0:
+                    exit_price = df['close'].iloc[idx]
                     # Apply slippage
                     exit_price = exit_price * (1 - self.config['slippage_rate'])
                     self.portfolio.close_position(symbol, exit_price, end_time, 'EndOfBacktest')

@@ -10,9 +10,9 @@ def to_ms(date_str):
 CONFIG = {
     # --- Data Source Paths ---
     # Futures data path (contains contract kline data in zip format)
-    'futures_data_path': '/path/to/futures/um/daily/klines',
+    'futures_data_path': '../../binance-public-data/test-data/futures/um/daily/klines',
     # Spot data path (for BTC reference)
-    'spot_data_path': '/path/to/spot/daily/klines',
+    'spot_data_path': '../../binance-public-data/test-data/spot/daily/klines',
     
     # --- Backtest Date Range ---
     'backtest_start_date': to_ms('2024-01-01 00:00:00'),
@@ -34,6 +34,8 @@ CONFIG = {
     'excluded_giants': ['BTC', 'ETH'],
     
     # --- Universe Selection ---
+    # Liquidity filter: minimum 24h quote volume in USDT
+    'min_24h_quote_volume': 10_000_000,  # 10M USDT minimum turnover
     # Top gainers selection: Top X% of 24h gainers with min/max bounds
     'top_gainers_pct': 0.10,  # Select top 10% of 24h gainers
     'top_gainers_min': 5,     # Minimum number of symbols to select
@@ -70,7 +72,7 @@ CONFIG = {
     
     # --- Trading Costs ---
     'fee_rate': 0.0005,  # 0.05% per trade
-    'slippage_rate': 0.005,  # 0.5% slippage (applied to both buy and sell)
+    'slippage_rate': 0.002,  # 0.2% slippage (applied to both buy and sell)
     
     # --- Contract Listing Cache ---
     'listing_cache_file': 'contract_listings.json',

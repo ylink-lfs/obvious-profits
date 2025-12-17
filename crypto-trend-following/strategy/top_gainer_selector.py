@@ -2,15 +2,18 @@
 # Selects top gaining contracts from the available universe
 
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 
 class TopGainerSelector:
     """
     Selects top gaining contracts from the available universe
-    based on 24-hour performance.
+    based on 24-hour performance with liquidity filter.
     
-    Selection strategy: Top X% of gainers with min/max bounds.
+    Selection strategy:
+    1. Filter by minimum 24h quote volume (liquidity)
+    2. Rank by 24h price change
+    3. Select Top X% of gainers with min/max bounds
     """
     
     def __init__(self, config, data_handler):
@@ -19,6 +22,8 @@ class TopGainerSelector:
         self.top_pct = config['top_gainers_pct']
         self.min_count = config['top_gainers_min']
         self.max_count = config['top_gainers_max']
+        # Minimum 24h quote volume in USDT (default 10M)
+        self.min_liquidity = config.get('min_24h_quote_volume', 10_000_000)
     
     def select_top_gainers(
         self,
@@ -30,7 +35,11 @@ class TopGainerSelector:
         """
         Select top gainers from available symbols based on 24h performance.
         
-        Selection logic: Top X% of gainers, bounded by [min_count, max_count].
+        Selection logic:
+        1. Filter by liquidity: 24h quote volume > min_liquidity (default 10M USDT)
+        2. Rank remaining symbols by 24h price change
+        3. Select Top X% of gainers, bounded by [min_count, max_count]
+        
         For example, with 10% and bounds [5, 20]:
         - 30 symbols -> top 10% = 3, but min is 5, so select 5
         - 100 symbols -> top 10% = 10, within bounds, so select 10
@@ -45,7 +54,8 @@ class TopGainerSelector:
         Returns:
             List of top gaining symbols
         """
-        performance: Dict[str, float] = {}
+        # Step 1: Load data and calculate metrics for all symbols
+        symbol_metrics: Dict[str, Tuple[float, float]] = {}  # symbol -> (change_24h, volume_24h)
         
         for symbol in available_symbols:
             df = self.data_handler.load_contract_data(
@@ -56,16 +66,24 @@ class TopGainerSelector:
                 continue
             
             change_24h = self.data_handler.calculate_24h_change(df, current_time)
-            performance[symbol] = change_24h
+            volume_24h = self.data_handler.calculate_24h_quote_volume(df, current_time)
+            symbol_metrics[symbol] = (change_24h, volume_24h)
         
-        # Sort by 24h change (descending)
+        # Step 2: Filter by liquidity (24h quote volume > threshold)
+        liquid_symbols = {
+            symbol: metrics[0]  # Keep only change_24h for ranking
+            for symbol, metrics in symbol_metrics.items()
+            if metrics[1] >= self.min_liquidity
+        }
+        
+        # Step 3: Sort by 24h change (descending)
         sorted_symbols = sorted(
-            performance.items(), 
+            liquid_symbols.items(), 
             key=lambda x: x[1], 
             reverse=True
         )
         
-        # Calculate selection count: Top X% with min/max bounds
+        # Step 4: Calculate selection count: Top X% with min/max bounds
         total_count = len(sorted_symbols)
         top_count = int(total_count * self.top_pct)
         

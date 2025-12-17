@@ -174,8 +174,11 @@ class MemeDataHandler:
             # Process timestamps
             df['timestamp'] = pd.to_datetime(df['open_time'], unit='ms')
             
-            # Select and clean columns
-            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            # Select and clean columns (include quote_volume for liquidity filter)
+            cols_to_keep = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            if 'quote_volume' in df.columns:
+                cols_to_keep.append('quote_volume')
+            df = df[cols_to_keep]
             
             # Filter to exact time range
             mask = (df['timestamp'] >= pd.to_datetime(start_ts, unit='ms')) & \
@@ -186,7 +189,8 @@ class MemeDataHandler:
             df.drop_duplicates(subset='timestamp', inplace=True)
             df.sort_values('timestamp', inplace=True)
             df.set_index('timestamp', inplace=True)
-            df = df.astype(float)
+            # Use float32 instead of float64 to save 50% memory
+            df = df.astype('float32')
             
             return df
             
@@ -195,7 +199,17 @@ class MemeDataHandler:
             return None
     
     def _read_zip_file(self, zip_path: str) -> Optional[pd.DataFrame]:
-        """Read CSV data from a zip file."""
+        """
+        Read CSV data from a zip file.
+        Handles both CSV files with and without headers dynamically.
+        """
+        # Standard column names for Binance kline data
+        column_names = [
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'number_of_trades',
+            'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
+        ]
+        
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
@@ -203,11 +217,30 @@ class MemeDataHandler:
                     return None
                 
                 with zf.open(csv_files[0]) as csv_file:
-                    df = pd.read_csv(csv_file, header=None, names=[
-                        'open_time', 'open', 'high', 'low', 'close', 'volume',
-                        'close_time', 'quote_asset_volume', 'number_of_trades',
-                        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-                    ])
+                    # Read first row to detect if it's a header
+                    df_probe = pd.read_csv(csv_file, nrows=1, header=None)
+                    
+                    if df_probe.empty:
+                        return None
+                    
+                    # Check if first row is a header (first value is non-numeric)
+                    first_value = df_probe.iloc[0, 0]
+                    has_header = False
+                    try:
+                        int(first_value)
+                    except (ValueError, TypeError):
+                        has_header = True
+                
+                # Re-read the file with proper handling
+                with zf.open(csv_files[0]) as csv_file:
+                    if has_header:
+                        # File has header - read it and rename columns
+                        df = pd.read_csv(csv_file)
+                        # Rename columns to standard names
+                        df.columns = column_names[:len(df.columns)]
+                    else:
+                        # File has no header - assign column names
+                        df = pd.read_csv(csv_file, header=None, names=column_names)
                     
                     # Handle microseconds timestamps (2025+ data)
                     if df['open_time'].iloc[0] > 1e15:
@@ -221,6 +254,7 @@ class MemeDataHandler:
     def prepare_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Add technical indicators needed for the meme strategy.
+        Also pre-calculates rolling metrics for vectorized performance.
         
         Args:
             df: DataFrame with OHLCV data
@@ -252,11 +286,28 @@ class MemeDataHandler:
         vol_ma_length = self.config['volume_ma_length']
         df['volume_ma'] = df['volume'].rolling(window=vol_ma_length).mean()
         
+        # --- Pre-calculated rolling indicators (Vectorization for performance) ---
+        # For 1m timeframe: 24h = 1440 bars, 1h = 60 bars
+        
+        # 1. Pre-calculate 24h price change (ROC)
+        # pct_change with periods=1440 gives instant 24h change
+        df['roc_24h'] = df['close'].pct_change(periods=1440)
+        
+        # 2. Pre-calculate 24h quote volume (rolling sum)
+        if 'quote_volume' not in df.columns:
+            # Estimate quote volume as close * volume
+            df['quote_volume'] = df['close'] * df['volume']
+        df['roll_qvol_24h'] = df['quote_volume'].rolling(window=1440, min_periods=1).sum()
+        
+        # 3. Pre-calculate 1h price change (for BTC circuit breaker and RS check)
+        df['roc_1h'] = df['close'].pct_change(periods=60)
+        
         return df
     
     def calculate_hourly_change(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
         """
         Calculate the 1-hour price change for a symbol.
+        Uses pre-calculated roc_1h column with O(log N) index lookup.
         
         Args:
             df: DataFrame with 1m OHLCV data
@@ -269,21 +320,27 @@ class MemeDataHandler:
             return 0.0
         
         try:
+            # Fast path: use pre-calculated roc_1h if available
+            if 'roc_1h' in df.columns:
+                # O(log N) index lookup using searchsorted
+                idx = df.index.searchsorted(current_time, side='right') - 1
+                if idx < 0 or idx >= len(df):
+                    return 0.0
+                val = df['roc_1h'].iloc[idx]
+                return float(val) if not pd.isna(val) else 0.0
+            
+            # Fallback: calculate on-the-fly (slower)
             one_hour_ago = current_time - pd.Timedelta(hours=1)
             
-            # Get price 1 hour ago
-            mask = df.index <= one_hour_ago
-            if not mask.any():
+            # Use searchsorted for O(log N) lookup
+            idx_1h = df.index.searchsorted(one_hour_ago, side='right') - 1
+            idx_now = df.index.searchsorted(current_time, side='right') - 1
+            
+            if idx_1h < 0 or idx_now < 0:
                 return 0.0
             
-            price_1h_ago = df.loc[mask, 'close'].iloc[-1]
-            
-            # Get current price
-            mask_current = df.index <= current_time
-            if not mask_current.any():
-                return 0.0
-            
-            current_price = df.loc[mask_current, 'close'].iloc[-1]
+            price_1h_ago = df['close'].iloc[idx_1h]
+            current_price = df['close'].iloc[idx_now]
             
             return (current_price - price_1h_ago) / price_1h_ago
             
@@ -293,6 +350,7 @@ class MemeDataHandler:
     def calculate_24h_change(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
         """
         Calculate the 24-hour price change for a symbol.
+        Uses pre-calculated roc_24h column with O(log N) index lookup.
         
         Args:
             df: DataFrame with 1m OHLCV data
@@ -305,21 +363,74 @@ class MemeDataHandler:
             return 0.0
         
         try:
+            # Fast path: use pre-calculated roc_24h if available
+            if 'roc_24h' in df.columns:
+                # O(log N) index lookup using searchsorted
+                idx = df.index.searchsorted(current_time, side='right') - 1
+                if idx < 0 or idx >= len(df):
+                    return 0.0
+                val = df['roc_24h'].iloc[idx]
+                return float(val) if not pd.isna(val) else 0.0
+            
+            # Fallback: calculate on-the-fly (slower)
             one_day_ago = current_time - pd.Timedelta(hours=24)
             
-            mask = df.index <= one_day_ago
-            if not mask.any():
+            # Use searchsorted for O(log N) lookup
+            idx_24h = df.index.searchsorted(one_day_ago, side='right') - 1
+            idx_now = df.index.searchsorted(current_time, side='right') - 1
+            
+            if idx_24h < 0 or idx_now < 0:
                 return 0.0
             
-            price_24h_ago = df.loc[mask, 'close'].iloc[-1]
-            
-            mask_current = df.index <= current_time
-            if not mask_current.any():
-                return 0.0
-            
-            current_price = df.loc[mask_current, 'close'].iloc[-1]
+            price_24h_ago = df['close'].iloc[idx_24h]
+            current_price = df['close'].iloc[idx_now]
             
             return (current_price - price_24h_ago) / price_24h_ago
+            
+        except Exception:
+            return 0.0
+    
+    def calculate_24h_quote_volume(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
+        """
+        Calculate the 24-hour quote volume (turnover in USDT) for a symbol.
+        Uses pre-calculated roll_qvol_24h column with O(log N) index lookup.
+        
+        Args:
+            df: DataFrame with 1m OHLCV data (must include quote_volume column)
+            current_time: Current timestamp
+            
+        Returns:
+            24-hour quote volume in USDT
+        """
+        if df is None or df.empty:
+            return 0.0
+        
+        try:
+            # Fast path: use pre-calculated roll_qvol_24h if available
+            if 'roll_qvol_24h' in df.columns:
+                # O(log N) index lookup using searchsorted
+                idx = df.index.searchsorted(current_time, side='right') - 1
+                if idx < 0 or idx >= len(df):
+                    return 0.0
+                val = df['roll_qvol_24h'].iloc[idx]
+                return float(val) if not pd.isna(val) else 0.0
+            
+            # Fallback: calculate on-the-fly (slower)
+            one_day_ago = current_time - pd.Timedelta(hours=24)
+            
+            # Use searchsorted for O(log N) range bounds
+            idx_start = df.index.searchsorted(one_day_ago, side='right')
+            idx_end = df.index.searchsorted(current_time, side='right')
+            
+            if idx_start >= idx_end:
+                return 0.0
+            
+            if 'quote_volume' in df.columns:
+                return float(df['quote_volume'].iloc[idx_start:idx_end].sum())
+            else:
+                # Estimate quote volume as close * volume
+                data_slice = df.iloc[idx_start:idx_end]
+                return float((data_slice['close'] * data_slice['volume']).sum())
             
         except Exception:
             return 0.0
@@ -345,19 +456,22 @@ class MemeDataHandler:
             return 0.0
         
         try:
-            mask = df.index < current_time
-            available_data = df.loc[mask]
+            # Use searchsorted for O(log N) index lookup
+            idx = df.index.searchsorted(current_time, side='left')
             
-            if len(available_data) <= exclude_last:
+            # Calculate the range: [idx - exclude_last - lookback, idx - exclude_last)
+            end_idx = idx - exclude_last
+            start_idx = end_idx - lookback
+            
+            if end_idx <= 0 or start_idx < 0:
+                # Not enough data
+                start_idx = max(0, start_idx)
+            
+            if start_idx >= end_idx:
                 return 0.0
             
-            # Exclude the last N candles and then take the lookback period
-            recent_data = available_data.iloc[:-exclude_last].tail(lookback)
-            
-            if recent_data.empty:
-                return 0.0
-            
-            return recent_data['low'].min()
+            # Get the lowest low in the range
+            return float(df['low'].iloc[start_idx:end_idx].min())
             
         except Exception:
             return 0.0

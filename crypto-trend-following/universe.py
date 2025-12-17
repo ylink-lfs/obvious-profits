@@ -6,12 +6,12 @@ import re
 import json
 import zipfile
 import pandas as pd
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class ContractListingScanner:
     """
-    Scans the data source to discover all contracts and their listing times.
+    Scans the data source to discover all contracts and their listing/delisting times.
     Results are cached to a JSON file for subsequent backtest runs.
     """
     
@@ -22,15 +22,16 @@ class ContractListingScanner:
             os.path.dirname(__file__), 
             config['listing_cache_file']
         )
-        self.listings: Dict[str, int] = {}  # symbol -> listing_timestamp_ms
+        # symbol -> {"start_time": timestamp_ms, "end_time": timestamp_ms}
+        self.listings: Dict[str, Dict[str, int]] = {}
         
-    def scan_contracts(self, force_rescan: bool = False) -> Dict[str, int]:
+    def scan_contracts(self, force_rescan: bool = False) -> Dict[str, Dict[str, int]]:
         """
-        Scan all contracts in the data source and get their listing times.
+        Scan all contracts in the data source and get their listing/delisting times.
         Uses cached results if available unless force_rescan is True.
         
         Returns:
-            Dict mapping symbol to listing timestamp (ms)
+            Dict mapping symbol to {"start_time": ms, "end_time": ms}
         """
         # Try to load from cache first
         if not force_rescan and os.path.exists(self.cache_file):
@@ -57,10 +58,13 @@ class ContractListingScanner:
             if not os.path.exists(timeframe_path):
                 continue
             
-            # Find the earliest zip file and get listing time
-            listing_time = self._get_contract_listing_time(symbol_dir, timeframe_path)
-            if listing_time:
-                self.listings[symbol_dir] = listing_time
+            # Find the listing and delisting times
+            times = self._get_contract_time_range(symbol_dir, timeframe_path)
+            if times:
+                self.listings[symbol_dir] = {
+                    "start_time": times[0],
+                    "end_time": times[1]
+                }
         
         # Save to cache
         print(f"[ContractScanner] Scanned {len(self.listings)} contracts. Saving to cache...")
@@ -69,12 +73,39 @@ class ContractListingScanner:
         
         return self.listings
     
-    def _get_contract_listing_time(self, symbol: str, timeframe_path: str) -> Optional[int]:
+    def _extract_date_from_filename(self, filename: str) -> Optional[str]:
         """
-        Get the listing time of a contract by reading the earliest data file.
+        Extract date string from filename like 'GRTUSDT-1m-2021-01-01.zip'.
+        Returns date string in format 'YYYY-MM-DD' for sorting.
+        """
+        # Match pattern: SYMBOL-TIMEFRAME-YYYY-MM-DD.zip
+        match = re.search(r'-(\d{4}-\d{2}-\d{2})\.zip$', filename)
+        if match:
+            return match.group(1)
+        return None
+    
+    def _sort_zip_files_by_date(self, zip_files: List[str]) -> List[str]:
+        """
+        Sort zip files by the date in their filename.
+        Files without valid dates are placed at the end.
+        """
+        def get_sort_key(filename):
+            date_str = self._extract_date_from_filename(filename)
+            # Return tuple: (has_date, date_string)
+            # Files with dates come first (False < True when negated)
+            if date_str:
+                return (0, date_str)
+            return (1, filename)  # Fallback to filename for files without date
+        
+        return sorted(zip_files, key=get_sort_key)
+    
+    def _get_contract_time_range(self, symbol: str, timeframe_path: str) -> Optional[Tuple[int, int]]:
+        """
+        Get the listing and delisting time of a contract by reading the earliest 
+        and latest data files.
         
         Returns:
-            Listing timestamp in milliseconds, or None if unable to determine
+            Tuple of (start_timestamp_ms, end_timestamp_ms), or None if unable to determine
         """
         try:
             # Find all zip files or date range folders
@@ -87,21 +118,34 @@ class ContractListingScanner:
             if date_range_folders:
                 # Use the date range folder
                 folder_path = os.path.join(timeframe_path, sorted(date_range_folders)[0])
-                zip_files = sorted([f for f in os.listdir(folder_path) if f.endswith('.zip')])
+                zip_files = [f for f in os.listdir(folder_path) if f.endswith('.zip')]
             else:
                 # Direct zip files in timeframe folder
-                zip_files = sorted([f for f in items if f.endswith('.zip')])
+                zip_files = [f for f in items if f.endswith('.zip')]
                 folder_path = timeframe_path
             
             if not zip_files:
                 return None
             
-            # Get the earliest zip file
-            earliest_zip = zip_files[0]
-            zip_path = os.path.join(folder_path, earliest_zip)
+            # Sort zip files by date in filename
+            sorted_zips = self._sort_zip_files_by_date(zip_files)
             
-            # Read the first row from the zip to get exact listing time
-            return self._read_first_timestamp_from_zip(zip_path)
+            # Get the earliest and latest zip files
+            earliest_zip = sorted_zips[0]
+            latest_zip = sorted_zips[-1]
+            
+            earliest_zip_path = os.path.join(folder_path, earliest_zip)
+            latest_zip_path = os.path.join(folder_path, latest_zip)
+            
+            # Read the first timestamp from earliest zip
+            start_time = self._read_first_timestamp_from_zip(earliest_zip_path)
+            
+            # Read the last timestamp from latest zip
+            end_time = self._read_last_timestamp_from_zip(latest_zip_path)
+            
+            if start_time and end_time:
+                return (start_time, end_time)
+            return None
             
         except Exception as e:
             print(f"[ContractScanner] Error scanning {symbol}: {e}")
@@ -119,13 +163,69 @@ class ContractListingScanner:
                     return None
                 
                 with zf.open(csv_files[0]) as csv_file:
-                    # Read just the first line to get the earliest timestamp
-                    df = pd.read_csv(csv_file, nrows=1, header=None)
+                    # Read the first two lines to handle both header and headerless CSVs
+                    df = pd.read_csv(csv_file, nrows=2, header=None)
                     if df.empty:
                         return None
                     
                     # First column is open_time (timestamp in ms)
-                    timestamp = int(df.iloc[0, 0])
+                    # Check if the first row is a header (non-numeric value)
+                    first_value = df.iloc[0, 0]
+                    try:
+                        timestamp = int(first_value)
+                    except (ValueError, TypeError):
+                        # First row is a header, use the second row
+                        if len(df) < 2:
+                            return None
+                        timestamp = int(df.iloc[1, 0])
+                    
+                    # Handle microseconds if present (2025+ data)
+                    if timestamp > 1e15:
+                        timestamp = timestamp // 1000
+                    
+                    return timestamp
+                    
+        except Exception as e:
+            print(f"[ContractScanner] Error reading zip {zip_path}: {e}")
+            return None
+    
+    def _read_last_timestamp_from_zip(self, zip_path: str) -> Optional[int]:
+        """
+        Read the last timestamp from a zip file containing CSV data.
+        """
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                # Get the CSV file inside the zip
+                csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
+                if not csv_files:
+                    return None
+                
+                with zf.open(csv_files[0]) as csv_file:
+                    # Read the entire file to get the last row
+                    # First, check if there's a header
+                    df = pd.read_csv(csv_file, nrows=1, header=None)
+                    if df.empty:
+                        return None
+                    
+                    # Check if first row is header
+                    has_header = False
+                    try:
+                        int(df.iloc[0, 0])
+                    except (ValueError, TypeError):
+                        has_header = True
+                
+                # Re-read the file with proper header handling
+                with zf.open(csv_files[0]) as csv_file:
+                    if has_header:
+                        df = pd.read_csv(csv_file)
+                    else:
+                        df = pd.read_csv(csv_file, header=None)
+                    
+                    if df.empty:
+                        return None
+                    
+                    # Get the last row's first column (open_time)
+                    timestamp = int(df.iloc[-1, 0])
                     
                     # Handle microseconds if present (2025+ data)
                     if timestamp > 1e15:
@@ -346,7 +446,7 @@ class UniverseManager:
         self.config = config
         self.scanner = ContractListingScanner(config)
         self.filter = UniverseFilter(config)
-        self.listings: Dict[str, int] = {}
+        self.listings: Dict[str, Dict[str, int]] = {}  # symbol -> {"start_time": ms, "end_time": ms}
     
     def initialize(self, force_rescan: bool = False):
         """Initialize by scanning contracts."""
@@ -356,6 +456,7 @@ class UniverseManager:
     def get_available_contracts(self, current_time_ms: int) -> List[str]:
         """
         Get list of contracts available at a specific time.
+        A contract is available if current_time is between its start_time and end_time.
         
         Args:
             current_time_ms: Current backtest time in milliseconds
@@ -363,10 +464,11 @@ class UniverseManager:
         Returns:
             List of available symbol strings (after filtering)
         """
-        # Get contracts that were listed before current time
+        # Get contracts that are active at current time
+        # (listed before current time AND not yet delisted)
         available = [
-            symbol for symbol, listing_time in self.listings.items()
-            if listing_time <= current_time_ms
+            symbol for symbol, times in self.listings.items()
+            if times["start_time"] <= current_time_ms <= times["end_time"]
         ]
         
         # Apply filters
@@ -375,5 +477,19 @@ class UniverseManager:
         return filtered
     
     def get_listing_time(self, symbol: str) -> Optional[int]:
-        """Get the listing time of a specific contract."""
-        return self.listings.get(symbol)
+        """Get the listing (start) time of a specific contract."""
+        if symbol in self.listings:
+            return self.listings[symbol]["start_time"]
+        return None
+    
+    def get_delisting_time(self, symbol: str) -> Optional[int]:
+        """Get the delisting (end) time of a specific contract."""
+        if symbol in self.listings:
+            return self.listings[symbol]["end_time"]
+        return None
+    
+    def get_contract_time_range(self, symbol: str) -> Optional[Tuple[int, int]]:
+        """Get the (start_time, end_time) tuple for a specific contract."""
+        if symbol in self.listings:
+            return (self.listings[symbol]["start_time"], self.listings[symbol]["end_time"])
+        return None

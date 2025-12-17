@@ -48,20 +48,31 @@ def main():
     print(f"\nTotal Contracts Found: {len(listings)}")
     
     if listings:
-        # Show sample of earliest and latest contracts
+        # Show sample of earliest and latest contracts by start time
         import pandas as pd
         
-        sorted_listings = sorted(listings.items(), key=lambda x: x[1])
+        sorted_by_start = sorted(listings.items(), key=lambda x: x[1]["start_time"])
         
-        print("\n--- Earliest Listed Contracts ---")
-        for symbol, ts in sorted_listings[:10]:
-            dt = pd.to_datetime(ts, unit='ms')
-            print(f"  {symbol}: {dt}")
+        print("\n--- Earliest Listed Contracts (by start time) ---")
+        for symbol, times in sorted_by_start[:10]:
+            start_dt = pd.to_datetime(times["start_time"], unit='ms')
+            end_dt = pd.to_datetime(times["end_time"], unit='ms')
+            print(f"  {symbol}: {start_dt} -> {end_dt}")
         
-        print("\n--- Latest Listed Contracts ---")
-        for symbol, ts in sorted_listings[-10:]:
-            dt = pd.to_datetime(ts, unit='ms')
-            print(f"  {symbol}: {dt}")
+        print("\n--- Latest Listed Contracts (by start time) ---")
+        for symbol, times in sorted_by_start[-10:]:
+            start_dt = pd.to_datetime(times["start_time"], unit='ms')
+            end_dt = pd.to_datetime(times["end_time"], unit='ms')
+            print(f"  {symbol}: {start_dt} -> {end_dt}")
+        
+        # Also show contracts sorted by end time (recently delisted)
+        sorted_by_end = sorted(listings.items(), key=lambda x: x[1]["end_time"])
+        
+        print("\n--- Earliest Delisted Contracts (by end time) ---")
+        for symbol, times in sorted_by_end[:10]:
+            start_dt = pd.to_datetime(times["start_time"], unit='ms')
+            end_dt = pd.to_datetime(times["end_time"], unit='ms')
+            print(f"  {symbol}: {start_dt} -> {end_dt}")
     
     print("\nDone!")
 
