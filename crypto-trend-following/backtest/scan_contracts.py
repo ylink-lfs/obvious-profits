@@ -1,10 +1,18 @@
-# scan_contracts.py
+# backtest/scan_contracts.py
 # Standalone script to scan and cache contract listing times
 # Run this before backtesting to build the contract universe cache
+# Usage: python -m backtest.scan_contracts [-f] [-d DATA_PATH]
 
 import argparse
+import os
+import sys
+import pandas as pd
+
+# Add parent directory to path for imports when run as script
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import CONFIG
-from universe import ContractListingScanner
+from core.universe import ContractListingScanner
 
 
 def main():
@@ -49,8 +57,6 @@ def main():
     
     if listings:
         # Show sample of earliest and latest contracts by start time
-        import pandas as pd
-        
         sorted_by_start = sorted(listings.items(), key=lambda x: x[1]["start_time"])
         
         print("\n--- Earliest Listed Contracts (by start time) ---")

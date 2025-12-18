@@ -1,6 +1,6 @@
-# portfolio.py
-# Meme Coin Strategy Portfolio Management
-# Handles position sizing, trade execution, and PnL tracking
+# backtest/portfolio.py
+# Backtest Portfolio Manager - Simulates position tracking and trade execution
+# Migrated from portfolio.py with updated imports
 
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
@@ -23,18 +23,19 @@ class Trade:
     fees_paid: float
 
 
-class MemePortfolio:
+class BacktestPortfolio:
     """
-    Portfolio manager for meme coin strategy.
+    Portfolio manager for backtest engine.
+    Simulates position tracking, trade execution, and PnL calculation.
     
     Features:
-    - Fixed position sizing (500 USD per trade)
-    - Fee and slippage handling
+    - Fixed position sizing
+    - Fee and slippage handling  
     - Trade logging and balance tracking
     """
     
     def __init__(self, config):
-        print("[Portfolio] Initializing MemePortfolio...")
+        print("[Portfolio] Initializing BacktestPortfolio...")
         self.config = config
         
         self.initial_capital = config['initial_capital']
@@ -61,6 +62,14 @@ class MemePortfolio:
     def get_position(self, symbol: str) -> Optional[Any]:
         """Get position for a symbol if exists."""
         return self.positions.get(symbol)
+    
+    def get_all_positions(self) -> Dict[str, Any]:
+        """Get all open positions."""
+        return self.positions
+    
+    def get_balance(self) -> float:
+        """Get current balance."""
+        return self.balance
     
     def open_position(
         self,
@@ -94,14 +103,15 @@ class MemePortfolio:
         # Deduct position capital from balance (fee is tracked separately)
         self.balance -= size_usd  # Lock the capital for the position
         
-        # Create position
+        # Create position using strategy's Position class for compatibility
         from strategy.meme_momentum import Position
         position = Position(
             symbol=symbol,
             entry_price=entry_price,
             entry_time=entry_time,
             size_usd=size_usd,
-            size_units=size_units
+            size_units=size_units,
+            highest_price=entry_price  # Initialize highest_price for trailing stop
         )
         
         self.positions[symbol] = position
@@ -168,7 +178,6 @@ class MemePortfolio:
         # Remove position
         del self.positions[symbol]
         
-
         return trade
     
     def update_balance_history(self, timestamp: pd.Timestamp, current_prices: Dict[str, float]):
@@ -220,3 +229,7 @@ class MemePortfolio:
             'final_balance': self.balance,
             'return_pct': ((self.balance - self.initial_capital) / self.initial_capital) * 100
         }
+
+
+# Alias for backward compatibility
+MemePortfolio = BacktestPortfolio

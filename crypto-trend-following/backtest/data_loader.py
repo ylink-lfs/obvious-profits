@@ -1,28 +1,97 @@
-# data_handler.py
-# Meme Coin Strategy Data Handler
-# Handles loading and preparing kline data from zip files for futures and spot markets
+# backtest/data_loader.py\n# Backtest Data Loader - Loads historical data from ZIP files\n# Migrated from data_handler.py with updated imports
 
 import pandas as pd
-import pandas_ta  # noqa: F401 - used via df.ta accessor
+import pandas_ta  # noqa: F401 - registers df.ta accessor
 import os
 import zipfile
 import glob
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 
-class MemeDataHandler:
+# Standalone function for parallel execution (must be at module level for pickling)
+def _read_zip_file_standalone(zip_path: str) -> Optional[pd.DataFrame]:
     """
-    Data handler for meme coin momentum strategy.
-    Supports loading data from zip files for multiple contracts.
+    Read CSV data from a zip file (standalone version for multiprocessing).
+    First checks if an extracted CSV file exists next to the zip file.
+    If CSV exists, loads it directly. Otherwise, extracts from zip and saves CSV.
+    """
+    column_names = [
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_volume', 'number_of_trades',
+        'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
+    ]
+    
+    # Check for cached CSV file (same name as zip but with .csv extension)
+    csv_cache_path = zip_path.replace('.zip', '.csv')
+    
+    try:
+        # Fast path: load from cached CSV if exists
+        if os.path.exists(csv_cache_path):
+            df = pd.read_csv(csv_cache_path)
+            # Handle microseconds timestamps (2025+ data)
+            if df['open_time'].iloc[0] > 1e15:
+                df['open_time'] = df['open_time'] // 1000
+            return df
+        
+        # Slow path: extract from zip and cache
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
+            if not csv_files:
+                return None
+            
+            with zf.open(csv_files[0]) as csv_file:
+                df_probe = pd.read_csv(csv_file, nrows=1, header=None)
+                if df_probe.empty:
+                    return None
+                first_value = df_probe.iloc[0, 0]
+                has_header = False
+                try:
+                    int(first_value)
+                except (ValueError, TypeError):
+                    has_header = True
+            
+            with zf.open(csv_files[0]) as csv_file:
+                if has_header:
+                    df = pd.read_csv(csv_file)
+                    df.columns = column_names[:len(df.columns)]
+                else:
+                    df = pd.read_csv(csv_file, header=None, names=column_names)
+                
+                # Handle microseconds timestamps (2025+ data)
+                if df['open_time'].iloc[0] > 1e15:
+                    df['open_time'] = df['open_time'] // 1000
+                
+                # Save to CSV cache for future runs
+                try:
+                    df.to_csv(csv_cache_path, index=False)
+                except Exception:
+                    pass  # Ignore write errors (permissions, disk space, etc.)
+                
+                return df
+    except Exception:
+        return None
+
+
+class BacktestDataLoader:
+    """
+    Data loader for backtest engine.
+    Loads historical kline data from Binance ZIP files.
+    
+    Supports:
+    - Multiple date range folders (e.g., 2020-2021 and 2021-2024 split)
+    - Dynamic header detection in CSV files
+    - Indicator pre-calculation for vectorized performance
     """
     
     def __init__(self, config):
-        print("[DataHandler] Initializing MemeDataHandler...")
+        print("[DataLoader] Initializing Fast Cache Mode (Periodic Dump)...")
         self.config = config
         self.futures_data_path = config['futures_data_path']
         self.spot_data_path = config['spot_data_path']
         
-        # Cache for loaded data
+        # Simple cache - just store, Engine will trigger full dump when memory high
         self._data_cache: Dict[str, pd.DataFrame] = {}
         self._btc_spot_cache: Optional[pd.DataFrame] = None
     
@@ -45,7 +114,8 @@ class MemeDataHandler:
         Returns:
             DataFrame with OHLCV data indexed by timestamp
         """
-        cache_key = f"{symbol}_{timeframe}_{start_ts}_{end_ts}"
+        # [Smart Cache] Use symbol as key (start/end are constant during backtest)
+        cache_key = symbol
         if cache_key in self._data_cache:
             return self._data_cache[cache_key]
         
@@ -58,6 +128,11 @@ class MemeDataHandler:
         df = self._load_zip_data(contract_path, symbol, timeframe, start_ts, end_ts)
         
         if df is not None and not df.empty:
+            # [Memory Optimization] Convert float64 -> float32 (50% memory savings)
+            float_cols = df.select_dtypes(include=['float64']).columns
+            df[float_cols] = df[float_cols].astype('float32')
+            
+            # Store in cache
             self._data_cache[cache_key] = df
         
         return df
@@ -82,7 +157,7 @@ class MemeDataHandler:
         btc_path = os.path.join(self.spot_data_path, 'BTCUSDT', '1m')
         
         if not os.path.exists(btc_path):
-            print(f"[DataHandler] WARNING: BTC spot data path not found: {btc_path}")
+            print(f"[DataLoader] WARNING: BTC spot data path not found: {btc_path}")
             return None
         
         df = self._load_zip_data(btc_path, 'BTCUSDT', '1m', start_ts, end_ts)
@@ -102,6 +177,7 @@ class MemeDataHandler:
     ) -> Optional[pd.DataFrame]:
         """
         Load kline data from zip files.
+        Handles multiple date range folders (e.g., 2020-2021 and 2021-2024 split).
         
         Args:
             base_path: Path to the timeframe directory
@@ -119,20 +195,27 @@ class MemeDataHandler:
             date_range_folders = [d for d in items if '_' in d and 
                                   os.path.isdir(os.path.join(base_path, d))]
             
+            # Collect all data folders to scan (may be multiple date ranges)
             if date_range_folders:
-                # Use date range folder
-                data_folder = os.path.join(base_path, sorted(date_range_folders)[0])
+                # Use ALL date range folders, not just the first one
+                data_folders = [os.path.join(base_path, f) for f in sorted(date_range_folders)]
             else:
-                data_folder = base_path
+                data_folders = [base_path]
             
-            # Find all zip files
-            zip_pattern = os.path.join(data_folder, f"{symbol}-{timeframe}-*.zip")
-            zip_files = sorted(glob.glob(zip_pattern))
+            # Find all zip files from ALL folders
+            zip_files = []
+            for data_folder in data_folders:
+                zip_pattern = os.path.join(data_folder, f"{symbol}-{timeframe}-*.zip")
+                folder_zips = glob.glob(zip_pattern)
+                
+                if not folder_zips:
+                    # Try without symbol prefix
+                    zip_pattern = os.path.join(data_folder, "*.zip")
+                    folder_zips = glob.glob(zip_pattern)
+                
+                zip_files.extend(folder_zips)
             
-            if not zip_files:
-                # Try without symbol prefix
-                zip_pattern = os.path.join(data_folder, "*.zip")
-                zip_files = sorted(glob.glob(zip_pattern))
+            zip_files = sorted(zip_files)
             
             if not zip_files:
                 return None
@@ -141,29 +224,47 @@ class MemeDataHandler:
             start_date = pd.to_datetime(start_ts, unit='ms').date()
             end_date = pd.to_datetime(end_ts, unit='ms').date()
             
-            dfs = []
+            # Build list of valid zip files to process
+            valid_zip_files = []
             for zip_path in zip_files:
-                # Extract date from filename
                 filename = os.path.basename(zip_path)
                 try:
-                    # Parse date from filename like "BTCUSDT-1m-2024-01-01.zip"
                     date_parts = filename.replace('.zip', '').split('-')
                     if len(date_parts) >= 4:
                         file_date = pd.to_datetime('-'.join(date_parts[-3:])).date()
                     else:
                         continue
-                    
-                    # Skip if outside date range
                     if file_date < start_date or file_date > end_date:
                         continue
-                    
-                    # Load data from zip
+                    valid_zip_files.append(zip_path)
+                except Exception:
+                    continue
+            
+            if not valid_zip_files:
+                return None
+            
+            # Parallel I/O: Read zip files using multiple processes
+            # Use min(8, num_files, cpu_count-1) workers to avoid overhead
+            n_workers = min(8, len(valid_zip_files), max(1, multiprocessing.cpu_count() - 1))
+            
+            dfs = []
+            if n_workers > 1 and len(valid_zip_files) > 4:
+                # Parallel path for many files
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    futures = {executor.submit(_read_zip_file_standalone, zp): zp for zp in valid_zip_files}
+                    for future in as_completed(futures):
+                        try:
+                            df_temp = future.result()
+                            if df_temp is not None:
+                                dfs.append(df_temp)
+                        except Exception:
+                            pass
+            else:
+                # Serial path for few files (avoid process spawn overhead)
+                for zip_path in valid_zip_files:
                     df_temp = self._read_zip_file(zip_path)
                     if df_temp is not None:
                         dfs.append(df_temp)
-                        
-                except Exception as e:
-                    continue
             
             if not dfs:
                 return None
@@ -195,12 +296,14 @@ class MemeDataHandler:
             return df
             
         except Exception as e:
-            print(f"[DataHandler] Error loading data for {symbol}: {e}")
+            print(f"[DataLoader] Error loading data for {symbol}: {e}")
             return None
     
     def _read_zip_file(self, zip_path: str) -> Optional[pd.DataFrame]:
         """
         Read CSV data from a zip file.
+        First checks if an extracted CSV file exists next to the zip file.
+        If CSV exists, loads it directly. Otherwise, extracts from zip and saves CSV.
         Handles both CSV files with and without headers dynamically.
         """
         # Standard column names for Binance kline data
@@ -210,7 +313,19 @@ class MemeDataHandler:
             'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
         ]
         
+        # Check for cached CSV file (same name as zip but with .csv extension)
+        csv_cache_path = zip_path.replace('.zip', '.csv')
+        
         try:
+            # Fast path: load from cached CSV if exists
+            if os.path.exists(csv_cache_path):
+                df = pd.read_csv(csv_cache_path)
+                # Handle microseconds timestamps (2025+ data)
+                if df['open_time'].iloc[0] > 1e15:
+                    df['open_time'] = df['open_time'] // 1000
+                return df
+            
+            # Slow path: extract from zip and cache
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
                 if not csv_files:
@@ -246,9 +361,15 @@ class MemeDataHandler:
                     if df['open_time'].iloc[0] > 1e15:
                         df['open_time'] = df['open_time'] // 1000
                     
+                    # Save to CSV cache for future runs
+                    try:
+                        df.to_csv(csv_cache_path, index=False)
+                    except Exception:
+                        pass  # Ignore write errors (permissions, disk space, etc.)
+                    
                     return df
                     
-        except Exception as e:
+        except Exception:
             return None
     
     def prepare_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -286,11 +407,24 @@ class MemeDataHandler:
         vol_ma_length = self.config['volume_ma_length']
         df['volume_ma'] = df['volume'].rolling(window=vol_ma_length).mean()
         
+        # ADX for trend strength filter
+        adx_length = self.config.get('adx_length', 14)
+        adx_result = df.ta.adx(high=df['high'], low=df['low'], close=df['close'], length=adx_length)
+        if adx_result is not None:
+            # ADX column name format: ADX_14
+            adx_col = [c for c in adx_result.columns if c.startswith('ADX_')][0]
+            df['adx'] = adx_result[adx_col]
+        
+        # ATR for Chandelier Exit (trailing stop)
+        atr_length = self.config.get('atr_length', 14)
+        atr_result = df.ta.atr(high=df['high'], low=df['low'], close=df['close'], length=atr_length)
+        if atr_result is not None:
+            df['atr'] = atr_result
+        
         # --- Pre-calculated rolling indicators (Vectorization for performance) ---
         # For 1m timeframe: 24h = 1440 bars, 1h = 60 bars
         
         # 1. Pre-calculate 24h price change (ROC)
-        # pct_change with periods=1440 gives instant 24h change
         df['roc_24h'] = df['close'].pct_change(periods=1440)
         
         # 2. Pre-calculate 24h quote volume (rolling sum)
@@ -302,181 +436,89 @@ class MemeDataHandler:
         # 3. Pre-calculate 1h price change (for BTC circuit breaker and RS check)
         df['roc_1h'] = df['close'].pct_change(periods=60)
         
+        # 4. Pre-calculate 24h EMA for regime filter (BTC trend check)
+        df['ema_24h'] = df['close'].ewm(span=1440, adjust=False).mean()
+        
+        # 5. Pre-calculate 60-min EMA for deviation filter (avoid buying at tops)
+        ema_dev_length = self.config.get('ema_deviation_length', 60)
+        df['ema_60'] = df['close'].ewm(span=ema_dev_length, adjust=False).mean()
+        
         return df
     
     def calculate_hourly_change(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
-        """
-        Calculate the 1-hour price change for a symbol.
-        Uses pre-calculated roc_1h column with O(log N) index lookup.
-        
-        Args:
-            df: DataFrame with 1m OHLCV data
-            current_time: Current timestamp
-            
-        Returns:
-            1-hour percentage change (e.g., 0.05 for 5%)
-        """
+        """Calculate the 1-hour price change for a symbol."""
         if df is None or df.empty:
             return 0.0
         
         try:
-            # Fast path: use pre-calculated roc_1h if available
             if 'roc_1h' in df.columns:
-                # O(log N) index lookup using searchsorted
                 idx = df.index.searchsorted(current_time, side='right') - 1
                 if idx < 0 or idx >= len(df):
                     return 0.0
                 val = df['roc_1h'].iloc[idx]
                 return float(val) if not pd.isna(val) else 0.0
-            
-            # Fallback: calculate on-the-fly (slower)
-            one_hour_ago = current_time - pd.Timedelta(hours=1)
-            
-            # Use searchsorted for O(log N) lookup
-            idx_1h = df.index.searchsorted(one_hour_ago, side='right') - 1
-            idx_now = df.index.searchsorted(current_time, side='right') - 1
-            
-            if idx_1h < 0 or idx_now < 0:
-                return 0.0
-            
-            price_1h_ago = df['close'].iloc[idx_1h]
-            current_price = df['close'].iloc[idx_now]
-            
-            return (current_price - price_1h_ago) / price_1h_ago
-            
+            return 0.0
         except Exception:
             return 0.0
     
     def calculate_24h_change(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
-        """
-        Calculate the 24-hour price change for a symbol.
-        Uses pre-calculated roc_24h column with O(log N) index lookup.
-        
-        Args:
-            df: DataFrame with 1m OHLCV data
-            current_time: Current timestamp
-            
-        Returns:
-            24-hour percentage change
-        """
+        """Calculate the 24-hour price change for a symbol."""
         if df is None or df.empty:
             return 0.0
         
         try:
-            # Fast path: use pre-calculated roc_24h if available
             if 'roc_24h' in df.columns:
-                # O(log N) index lookup using searchsorted
                 idx = df.index.searchsorted(current_time, side='right') - 1
                 if idx < 0 or idx >= len(df):
                     return 0.0
                 val = df['roc_24h'].iloc[idx]
                 return float(val) if not pd.isna(val) else 0.0
-            
-            # Fallback: calculate on-the-fly (slower)
-            one_day_ago = current_time - pd.Timedelta(hours=24)
-            
-            # Use searchsorted for O(log N) lookup
-            idx_24h = df.index.searchsorted(one_day_ago, side='right') - 1
-            idx_now = df.index.searchsorted(current_time, side='right') - 1
-            
-            if idx_24h < 0 or idx_now < 0:
-                return 0.0
-            
-            price_24h_ago = df['close'].iloc[idx_24h]
-            current_price = df['close'].iloc[idx_now]
-            
-            return (current_price - price_24h_ago) / price_24h_ago
-            
+            return 0.0
         except Exception:
             return 0.0
     
     def calculate_24h_quote_volume(self, df: pd.DataFrame, current_time: pd.Timestamp) -> float:
-        """
-        Calculate the 24-hour quote volume (turnover in USDT) for a symbol.
-        Uses pre-calculated roll_qvol_24h column with O(log N) index lookup.
-        
-        Args:
-            df: DataFrame with 1m OHLCV data (must include quote_volume column)
-            current_time: Current timestamp
-            
-        Returns:
-            24-hour quote volume in USDT
-        """
+        """Calculate the 24-hour quote volume (turnover in USDT) for a symbol."""
         if df is None or df.empty:
             return 0.0
         
         try:
-            # Fast path: use pre-calculated roll_qvol_24h if available
             if 'roll_qvol_24h' in df.columns:
-                # O(log N) index lookup using searchsorted
                 idx = df.index.searchsorted(current_time, side='right') - 1
                 if idx < 0 or idx >= len(df):
                     return 0.0
                 val = df['roll_qvol_24h'].iloc[idx]
                 return float(val) if not pd.isna(val) else 0.0
-            
-            # Fallback: calculate on-the-fly (slower)
-            one_day_ago = current_time - pd.Timedelta(hours=24)
-            
-            # Use searchsorted for O(log N) range bounds
-            idx_start = df.index.searchsorted(one_day_ago, side='right')
-            idx_end = df.index.searchsorted(current_time, side='right')
-            
-            if idx_start >= idx_end:
-                return 0.0
-            
-            if 'quote_volume' in df.columns:
-                return float(df['quote_volume'].iloc[idx_start:idx_end].sum())
-            else:
-                # Estimate quote volume as close * volume
-                data_slice = df.iloc[idx_start:idx_end]
-                return float((data_slice['close'] * data_slice['volume']).sum())
-            
+            return 0.0
         except Exception:
             return 0.0
     
-    def get_lowest_low(self, df: pd.DataFrame, current_time: pd.Timestamp, lookback: int, exclude_last: int = 1) -> float:
+    def clear_all_cache(self):
         """
-        Get the lowest low of the last N candles (excluding the most recent candles).
-        
-        For structural exit, we compare prev_bar's close against lowest_low of 
-        the 20 candles BEFORE prev_bar, so we need to exclude the last candle 
-        from the lookback window.
-        
-        Args:
-            df: DataFrame with OHLCV data
-            current_time: Current timestamp
-            lookback: Number of candles to look back
-            exclude_last: Number of most recent candles to exclude (default 1)
-            
-        Returns:
-            Lowest low price
+        Nuclear option: Clear ALL cached DataFrames.
+        Called by Engine when memory exceeds threshold.
         """
-        if df is None or df.empty:
-            return 0.0
-        
-        try:
-            # Use searchsorted for O(log N) index lookup
-            idx = df.index.searchsorted(current_time, side='left')
-            
-            # Calculate the range: [idx - exclude_last - lookback, idx - exclude_last)
-            end_idx = idx - exclude_last
-            start_idx = end_idx - lookback
-            
-            if end_idx <= 0 or start_idx < 0:
-                # Not enough data
-                start_idx = max(0, start_idx)
-            
-            if start_idx >= end_idx:
-                return 0.0
-            
-            # Get the lowest low in the range
-            return float(df['low'].iloc[start_idx:end_idx].min())
-            
-        except Exception:
-            return 0.0
-    
-    def clear_cache(self):
-        """Clear all cached data."""
+        cache_size = len(self._data_cache)
         self._data_cache.clear()
         self._btc_spot_cache = None
+        print(f"[DataLoader] Nuked {cache_size} cached DataFrames.")
+    
+    def keep_only(self, active_symbols: set):
+        """
+        [Survivor Strategy] Keep only active symbols, prune the rest.
+        Avoids cache stampede by preserving hot data.
+        """
+        cached_symbols = list(self._data_cache.keys())
+        deleted_count = 0
+        
+        for symbol in cached_symbols:
+            if symbol not in active_symbols:
+                del self._data_cache[symbol]
+                deleted_count += 1
+        
+        if deleted_count > 0:
+            print(f"[DataLoader] Pruned {deleted_count} inactive. Kept {len(self._data_cache)} active.")
+
+
+# Alias for backward compatibility
+MemeDataHandler = BacktestDataLoader

@@ -18,10 +18,7 @@ class ContractListingScanner:
     def __init__(self, config):
         self.config = config
         self.futures_data_path = config['futures_data_path']
-        self.cache_file = os.path.join(
-            os.path.dirname(__file__), 
-            config['listing_cache_file']
-        )
+        self.cache_file = config['listing_cache_file']  # Already absolute path from config
         # symbol -> {"start_time": timestamp_ms, "end_time": timestamp_ms}
         self.listings: Dict[str, Dict[str, int]] = {}
         
@@ -115,27 +112,36 @@ class ContractListingScanner:
             date_range_folders = [d for d in items if '_' in d and os.path.isdir(
                 os.path.join(timeframe_path, d))]
             
+            # Collect all zip files from ALL date range folders
+            zip_files = []
+            folder_paths = []
+            
             if date_range_folders:
-                # Use the date range folder
-                folder_path = os.path.join(timeframe_path, sorted(date_range_folders)[0])
-                zip_files = [f for f in os.listdir(folder_path) if f.endswith('.zip')]
+                # Scan ALL date range folders, not just the first one
+                for folder_name in sorted(date_range_folders):
+                    folder_path = os.path.join(timeframe_path, folder_name)
+                    folder_zips = [f for f in os.listdir(folder_path) if f.endswith('.zip')]
+                    for zf in folder_zips:
+                        zip_files.append(zf)
+                        folder_paths.append(folder_path)
             else:
                 # Direct zip files in timeframe folder
                 zip_files = [f for f in items if f.endswith('.zip')]
-                folder_path = timeframe_path
+                folder_paths = [timeframe_path] * len(zip_files)
             
             if not zip_files:
                 return None
             
-            # Sort zip files by date in filename
-            sorted_zips = self._sort_zip_files_by_date(zip_files)
+            # Sort zip files by date in filename and keep track of their folder paths
+            zip_with_paths = list(zip(zip_files, folder_paths))
+            sorted_zips = sorted(zip_with_paths, key=lambda x: self._extract_date_from_filename(x[0]) or '')
             
             # Get the earliest and latest zip files
-            earliest_zip = sorted_zips[0]
-            latest_zip = sorted_zips[-1]
+            earliest_zip, earliest_folder = sorted_zips[0]
+            latest_zip, latest_folder = sorted_zips[-1]
             
-            earliest_zip_path = os.path.join(folder_path, earliest_zip)
-            latest_zip_path = os.path.join(folder_path, latest_zip)
+            earliest_zip_path = os.path.join(earliest_folder, earliest_zip)
+            latest_zip_path = os.path.join(latest_folder, latest_zip)
             
             # Read the first timestamp from earliest zip
             start_time = self._read_first_timestamp_from_zip(earliest_zip_path)
@@ -299,8 +305,6 @@ class UniverseFilter:
             before_count = len(filtered)
             filtered = f.filter(filtered)
             removed = before_count - len(filtered)
-            if removed > 0:
-                print(f"[UniverseFilter] {f.__class__.__name__} removed {removed} symbols")
         
         return filtered
 
