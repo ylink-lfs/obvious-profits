@@ -375,7 +375,8 @@ class BacktestDataLoader:
     def prepare_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Add technical indicators needed for the meme strategy.
-        Also pre-calculates rolling metrics for vectorized performance.
+        Supports dimension reduction: can resample to higher timeframes (15m, 1h)
+        while keeping 1m precision for exits.
         
         Args:
             df: DataFrame with OHLCV data
@@ -388,60 +389,130 @@ class BacktestDataLoader:
         
         df = df.copy()
         
-        # Bollinger Bands for volatility breakout
-        bb_length = self.config['bb_length']
-        bb_std = self.config['bb_std']
+        # 1. Base 1m indicators (for risk control)
+        # ----------------------------------------------------
+        # ATR always calculated at 1m level to capture instant volatility for stops
+        df['atr_1m'] = df.ta.atr(high=df['high'], low=df['low'], close=df['close'], length=14)
         
-        bbands = df.ta.bbands(
-            close=df['close'],
-            length=bb_length,
-            std=bb_std
-        )
+        # Get strategy timeframe configuration
+        tf_mins = self.config.get('strategy_timeframe_minutes', 1)
         
-        if bbands is not None:
-            # Find the upper band column
-            upper_col = [c for c in bbands.columns if c.startswith('BBU')][0]
-            df['bb_upper'] = bbands[upper_col]
-        
-        # Volume MA for confirmation
-        vol_ma_length = self.config['volume_ma_length']
-        df['volume_ma'] = df['volume'].rolling(window=vol_ma_length).mean()
-        
-        # ADX for trend strength filter
-        adx_length = self.config.get('adx_length', 14)
-        adx_result = df.ta.adx(high=df['high'], low=df['low'], close=df['close'], length=adx_length)
-        if adx_result is not None:
-            # ADX column name format: ADX_14
-            adx_col = [c for c in adx_result.columns if c.startswith('ADX_')][0]
-            df['adx'] = adx_result[adx_col]
-        
-        # ATR for Chandelier Exit (trailing stop)
-        atr_length = self.config.get('atr_length', 14)
-        atr_result = df.ta.atr(high=df['high'], low=df['low'], close=df['close'], length=atr_length)
-        if atr_result is not None:
-            df['atr'] = atr_result
-        
-        # --- Pre-calculated rolling indicators (Vectorization for performance) ---
-        # For 1m timeframe: 24h = 1440 bars, 1h = 60 bars
-        
-        # 1. Pre-calculate 24h price change (ROC)
+        # ============================================================
+        # Dimension Reduction Logic (15m/1h)
+        # ============================================================
+        if tf_mins > 1:
+            # 1. Resample to target timeframe
+            # label='left', closed='left': 10:00 timestamp represents data from 10:00-10:14
+            # This is the standard pandas resampling mode
+            df_res = df.resample(f'{tf_mins}min', label='left', closed='left').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            })
+            
+            # 2. Calculate indicators on resampled DF
+            # BBands
+            bbands = df_res.ta.bbands(close=df_res['close'], length=self.config['bb_length'], std=self.config['bb_std'])
+            if bbands is not None:
+                upper_col = [c for c in bbands.columns if c.startswith('BBU')][0]
+                df_res['strat_bb_upper'] = bbands[upper_col]
+            
+            # Volume MA
+            df_res['strat_volume_ma'] = df_res['volume'].rolling(window=self.config['volume_ma_length']).mean()
+            
+            # ADX
+            adx_res = df_res.ta.adx(high=df_res['high'], low=df_res['low'], close=df_res['close'], length=self.config.get('adx_length', 14))
+            if adx_res is not None:
+                adx_col = [c for c in adx_res.columns if c.startswith('ADX_')][0]
+                df_res['strat_adx'] = adx_res[adx_col]
+
+            # ATR (critical: risk management indicator)
+            df_res['strat_atr'] = df_res.ta.atr(high=df_res['high'], low=df_res['low'], close=df_res['close'], length=self.config.get('atr_length', 14))
+            
+            # EMA 60 (trend filter)
+            df_res['strat_ema_60'] = df_res['close'].ewm(span=self.config.get('ema_deviation_length', 60), adjust=False).mean()
+            
+            # ROC 1h (momentum) - adjust period based on timeframe
+            # If we want 60 minutes of change: 15m * 4 = 60m
+            roc_period = int(60 / tf_mins)
+            df_res['strat_roc_1h'] = df_res['close'].pct_change(periods=roc_period)
+            
+            # Save original OHLCV for strategy logic
+            df_res['strat_open'] = df_res['open']
+            df_res['strat_high'] = df_res['high']
+            df_res['strat_close'] = df_res['close']
+            df_res['strat_volume'] = df_res['volume']
+
+            # 3. SAFE MAPPING with shift(1) to prevent look-ahead bias
+            # Key fix: Shift the 10:00 calculation result to 10:15 timestamp
+            # When Engine runs at 10:15, it reads the "just completed 10:00-10:14 candle" data
+            # All strat_ indicators must use shift(1) to avoid peeking at the forming candle
+            cols_to_map = ['strat_bb_upper', 'strat_volume_ma', 'strat_adx', 'strat_ema_60', 'strat_roc_1h', 'strat_open', 'strat_high', 'strat_close', 'strat_volume']
+            
+            # Shift 1 period (15m) and reindex back to 1m timeline (ffill)
+            # Every minute from 10:15..10:29 will read 10:00 bin's data (Safe)
+            mapped = df_res[cols_to_map].shift(1).reindex(df.index, method='ffill')
+            
+            for col in cols_to_map:
+                df[col] = mapped[col]
+
+            # [B] Safe columns for risk management - 1m ATR for most sensitive stops
+            # Use 1m ATR regardless of strategy timeframe for tight risk control
+            df['atr'] = df['atr_1m']
+            
+        else:
+            # ============================================================
+            # Original 1m logic (for rollback)
+            # ============================================================
+            bbands = df.ta.bbands(close=df['close'], length=self.config['bb_length'], std=self.config['bb_std'])
+            if bbands is not None:
+                upper_col = [c for c in bbands.columns if c.startswith('BBU')][0]
+                df['strat_bb_upper'] = bbands[upper_col]
+            
+            df['strat_volume_ma'] = df['volume'].rolling(window=self.config['volume_ma_length']).mean()
+            
+            adx_res = df.ta.adx(high=df['high'], low=df['low'], close=df['close'], length=self.config.get('adx_length', 14))
+            if adx_res is not None:
+                adx_col = [c for c in adx_res.columns if c.startswith('ADX_')][0]
+                df['strat_adx'] = adx_res[adx_col]
+            
+            df['strat_ema_60'] = df['close'].ewm(span=self.config.get('ema_deviation_length', 60), adjust=False).mean()
+            df['strat_roc_1h'] = df['close'].pct_change(periods=60)
+            df['strat_open'] = df['open']
+            df['strat_high'] = df['high']
+            df['strat_close'] = df['close']
+            df['strat_volume'] = df['volume']
+            
+            # Use 1m ATR for risk control
+            df['atr'] = df['atr_1m']
+
+        # Common indicators (1m level, always needed)
+        # 24h change (for coin selection)
         df['roc_24h'] = df['close'].pct_change(periods=1440)
-        
-        # 2. Pre-calculate 24h quote volume (rolling sum)
         if 'quote_volume' not in df.columns:
-            # Estimate quote volume as close * volume
             df['quote_volume'] = df['close'] * df['volume']
         df['roll_qvol_24h'] = df['quote_volume'].rolling(window=1440, min_periods=1).sum()
-        
-        # 3. Pre-calculate 1h price change (for BTC circuit breaker and RS check)
-        df['roc_1h'] = df['close'].pct_change(periods=60)
-        
-        # 4. Pre-calculate 24h EMA for regime filter (BTC trend check)
         df['ema_24h'] = df['close'].ewm(span=1440, adjust=False).mean()
         
-        # 5. Pre-calculate 60-min EMA for deviation filter (avoid buying at tops)
-        ema_dev_length = self.config.get('ema_deviation_length', 60)
-        df['ema_60'] = df['close'].ewm(span=ema_dev_length, adjust=False).mean()
+        # ============================================================
+        # [SHORT Strategy Indicators] Post-Hype Butcher
+        # ============================================================
+        # EMA 20 (short-term support line)
+        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
+        
+        # VWAP (Volume Weighted Average Price) - institutional cost basis
+        # Approximation using cumulative values
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+        
+        # RSI (for overbought detection)
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
         
         return df
     

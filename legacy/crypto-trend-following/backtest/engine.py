@@ -71,6 +71,9 @@ class BacktestEngine:
         self.daily_trades: Dict[str, List[str]] = {}  # symbol -> list of date strings
         self.max_daily_trades = config.get('max_daily_trades_per_symbol', 1)
         
+        # [Cooldown] Track last exit time to prevent churn
+        self.cooldown_tracker: Dict[str, int] = {}  # symbol -> last_exit_time_ms
+        
         # [Rolling Window] Track loaded time ranges for each symbol
         # symbol -> (loaded_start_ms, loaded_end_ms)
         self.contract_loaded_ranges: Dict[str, tuple] = {}
@@ -327,6 +330,7 @@ class BacktestEngine:
         """
         Process entry/exit logic for a single symbol.
         OPTIMIZED: Uses numpy arrays directly, no pandas iloc overhead.
+        Supports dimension reduction: checks entries only at candle boundaries.
         """
         # Ensure data is loaded (triggers _get_contract_data which populates caches)
         current_time_ms = current_time_ns // 10**6
@@ -346,24 +350,17 @@ class BacktestEngine:
         if idx < 2:
             return
         
+        # Check if we're at a strategy timeframe boundary (for entries only)
+        # For 15m strategy: only check entries at 10:00, 10:15, 10:30, 10:45, etc.
+        tf_mins = self.config.get('strategy_timeframe_minutes', 1)
+        is_candle_close = (current_time.minute % tf_mins == 0)
+        
         # ============================================================
         # FAST PATH: Extract scalar values directly from numpy arrays
         # This is 20-50x faster than df.iloc[idx] which creates Series
         # ============================================================
         
-        # Previous bar (idx-1) - used for entry signals
-        prev_close = arrays['close'][idx - 1]
-        prev_open = arrays['open'][idx - 1]
-        prev_high = arrays['high'][idx - 1]
-        prev_volume = arrays['volume'][idx - 1]
-        prev_vol_ma = arrays['volume_ma'][idx - 1]
-        prev_bb_upper = arrays['bb_upper'][idx - 1]
-        prev_adx = arrays['adx'][idx - 1]
-        
-        # Bar before prev (idx-2) - for entry filter
-        bbp_high = arrays['high'][idx - 2]
-        
-        # Current bar (idx) - for exit checks
+        # Current bar (idx) - for exit checks (always 1m precision)
         curr_high = arrays['high'][idx]
         curr_low = arrays['low'][idx]
         curr_atr = arrays['atr'][idx]
@@ -371,37 +368,75 @@ class BacktestEngine:
         # Check if we have a position in this symbol
         position = self.portfolio.get_position(symbol)
         
+        # Get trade direction from config
+        trade_direction = self.config.get('trade_direction', 'LONG')
+        
+        # [Day-1] Get listing time for this symbol (for Day-1 strategy mode)
+        listing_time_ms = self.universe_manager.get_listing_time(symbol) or 0
+        current_time_ms = current_time_ns // 1_000_000  # Convert ns to ms
+        
         if position is not None:
-            # --- FAST EXIT CHECK ---
+            # --- FAST EXIT CHECK (1m precision maintained) ---
+            # Exit checks run every minute for tight risk control
             entry_time_ns = position.entry_time.value  # Timestamp to nanoseconds
             
-            should_exit, exit_reason, new_highest = self.strategy.check_exit_signal_fast(
+            # Use 1m data for exit precision
+            prev_close = arrays['close'][idx - 1]
+            
+            should_exit, exit_reason, new_highest, new_lowest = self.strategy.check_exit_signal_fast(
                 curr_high, curr_low, prev_close,
                 position.entry_price, position.highest_price,
                 entry_time_ns, current_time_ns,
-                curr_atr if not np.isnan(curr_atr) else 0.0
+                curr_atr if not np.isnan(curr_atr) else 0.0,
+                position.lowest_price,
+                position.side,
+                listing_time_ms,
+                current_time_ms
             )
             
-            # Update position's highest price
+            # Update position's price extremes
             position.highest_price = new_highest
+            position.lowest_price = new_lowest
             
             if should_exit:
                 # Calculate exit price with slippage
                 slippage = self.config['slippage_rate']
-                if exit_reason == 'DisasterStop':
-                    exit_price = curr_low * (1 - slippage)
+                if position.side == 'LONG':
+                    # LONG exit: selling, price slips down
+                    if exit_reason == 'DisasterStop':
+                        exit_price = curr_low * (1 - slippage)
+                    else:
+                        exit_price = arrays['close'][idx] * (1 - slippage)
                 else:
-                    exit_price = arrays['close'][idx] * (1 - slippage)
+                    # SHORT exit: buying back, price slips up
+                    if exit_reason == 'DisasterStop':
+                        exit_price = curr_high * (1 + slippage)
+                    else:
+                        exit_price = arrays['close'][idx] * (1 + slippage)
                 
                 self.portfolio.close_position(symbol, exit_price, current_time, exit_reason)
+                
+                # [Cooldown] Record exit time to prevent re-entry churn
+                self.cooldown_tracker[symbol] = current_time_ms
         
         else:
-            # --- FAST ENTRY CHECK ---
+            # --- ENTRY CHECK (filtered by strategy timeframe) ---
+            # Only check entries at candle boundaries (e.g., every 15m)
+            if not is_candle_close:
+                return  # Not at strategy timeframe boundary, skip entry check
+            
             if not self.portfolio.can_open_position():
                 return
             
+            # --- COOLDOWN CHECK (prevent churn) ---
+            cooldown_mins = self.config.get('cooldown_minutes', 0)
+            if cooldown_mins > 0:
+                last_exit_ms = self.cooldown_tracker.get(symbol, 0)
+                cooldown_ms = cooldown_mins * 60 * 1000
+                if (current_time_ms - last_exit_ms) < cooldown_ms:
+                    return  # Still in cooldown period
+            
             # --- DAILY TRADE LIMIT CHECK ---
-            # Max 1 trade per symbol per day to avoid over-trading
             date_str = current_time.strftime('%Y-%m-%d')
             if symbol not in self.daily_trades:
                 self.daily_trades[symbol] = []
@@ -409,25 +444,85 @@ class BacktestEngine:
             if self.daily_trades[symbol].count(date_str) >= self.max_daily_trades:
                 return  # Already hit daily limit for this symbol
             
-            # Get coin's 1h change (use pre-calculated roc_1h if available)
-            # Use idx-1 to avoid look-ahead bias
-            coin_1h_change = arrays['roc_1h'][idx - 1]
-            if np.isnan(coin_1h_change):
-                coin_1h_change = 0.0
+            # Use strategy timeframe data (strat_* columns)
+            # At 10:15, we read idx (current moment) which contains the just-completed 10:00-10:15 candle
+            # This is safe because resample uses label='right': 10:15 timestamp = 10:00-10:15 data
+            prev_close_strat = arrays['strat_close'][idx]
+            prev_high_strat = arrays['strat_high'][idx]
+            prev_volume_strat = arrays['strat_volume'][idx]
+            prev_vol_ma_strat = arrays['strat_volume_ma'][idx]
+            prev_bb_upper_strat = arrays['strat_bb_upper'][idx]
+            prev_adx_strat = arrays['strat_adx'][idx]
+            prev_ema_60_strat = arrays['strat_ema_60'][idx]
+            coin_1h_change_strat = arrays['strat_roc_1h'][idx]
             
-            # Get EMA60 for deviation filter (use idx-1 for lagged value)
-            prev_ema_60 = arrays['ema_60'][idx - 1]
+            if np.isnan(coin_1h_change_strat):
+                coin_1h_change_strat = 0.0
             
-            # Fast entry signal check
+            # BBP High (bar before previous) - previous period's high
+            # For 15m strategy: go back 15 minutes to get previous candle
+            prev_period_idx = max(0, idx - tf_mins)
+            bbp_high_strat = arrays['strat_high'][prev_period_idx]
+            
+            # Get strat_open for SHORT logic (red candle detection)
+            prev_open_strat = arrays['strat_open'][idx] if 'strat_open' in arrays else 0.0
+            
+            # [SHORT Strategy] Get VWAP, EMA 20, RSI for Post-Hype Butcher
+            prev_ema_20 = arrays['ema_20'][idx] if 'ema_20' in arrays else np.nan
+            prev_vwap = arrays['vwap'][idx] if 'vwap' in arrays else np.nan
+            prev_rsi = arrays['rsi'][idx] if 'rsi' in arrays else np.nan
+            
+            # [Day-1] Calculate ORB (Opening Range Breakout) high price
+            # listing_high_15m = max(high) of first 15 candles after listing
+            listing_high_15m = 0.0
+            if listing_time_ms > 0:
+                wait_mins = self.config.get('day1_wait_minutes', 15)
+                time_since_listing_ms = current_time_ms - listing_time_ms
+                
+                # Only calculate after wait period has passed
+                if time_since_listing_ms >= wait_mins * 60 * 1000:
+                    # Find the index of listing time in arrays
+                    listing_ts_ns = listing_time_ms * 1_000_000
+                    start_idx = np.searchsorted(timestamps, listing_ts_ns, side='left')
+                    
+                    if start_idx < len(timestamps):
+                        # Get first 15 candles (assuming 1m data)
+                        end_idx = min(start_idx + wait_mins, len(timestamps))
+                        if end_idx > start_idx:
+                            listing_high_15m = float(np.max(arrays['high'][start_idx:end_idx]))
+            
+            # Fast entry signal check using strategy timeframe data
             if self.strategy.check_entry_signal_fast(
-                prev_close, prev_open, prev_high,
-                prev_volume, prev_vol_ma, prev_bb_upper, prev_adx,
-                bbp_high, coin_1h_change, btc_1h_change, btc_above_ema,
-                prev_ema_60
+                prev_close_strat, 
+                prev_open_strat,  # Pass open for red candle check
+                prev_high_strat,
+                prev_volume_strat, 
+                prev_vol_ma_strat, 
+                prev_bb_upper_strat, 
+                prev_adx_strat,
+                bbp_high_strat, 
+                coin_1h_change_strat, 
+                btc_1h_change, 
+                btc_above_ema,
+                prev_ema_60_strat,
+                trade_direction,
+                listing_time_ms,
+                current_time_ms,
+                listing_high_15m,
+                prev_ema_20,
+                prev_vwap,
+                prev_rsi
             ):
-                # Calculate entry price with slippage
-                entry_price = prev_close * (1 + self.config['slippage_rate'])
-                self.portfolio.open_position(symbol, entry_price, current_time)
+                # Calculate entry price with slippage (use 1m close for execution)
+                slippage = self.config['slippage_rate']
+                if trade_direction == 'LONG':
+                    # LONG: buying, price slips up
+                    entry_price = arrays['close'][idx] * (1 + slippage)
+                else:
+                    # SHORT: selling, price slips down
+                    entry_price = arrays['close'][idx] * (1 - slippage)
+                
+                self.portfolio.open_position(symbol, entry_price, current_time, side=trade_direction)
                 
                 # Record this trade for daily limit tracking
                 self.daily_trades[symbol].append(date_str)
@@ -564,6 +659,16 @@ class BacktestEngine:
                 'atr': df['atr'].values.astype(np.float64) if 'atr' in df.columns else np.full(len(df), np.nan),
                 'roc_1h': df['roc_1h'].values.astype(np.float64) if 'roc_1h' in df.columns else np.full(len(df), np.nan),
                 'ema_60': df['ema_60'].values.astype(np.float64) if 'ema_60' in df.columns else np.full(len(df), np.nan),
+                # Strategy timeframe columns (for dimension reduction)
+                'strat_bb_upper': df['strat_bb_upper'].values.astype(np.float64) if 'strat_bb_upper' in df.columns else np.full(len(df), np.nan),
+                'strat_volume': df['strat_volume'].values.astype(np.float64) if 'strat_volume' in df.columns else np.full(len(df), np.nan),
+                'strat_volume_ma': df['strat_volume_ma'].values.astype(np.float64) if 'strat_volume_ma' in df.columns else np.full(len(df), np.nan),
+                'strat_adx': df['strat_adx'].values.astype(np.float64) if 'strat_adx' in df.columns else np.full(len(df), np.nan),
+                'strat_ema_60': df['strat_ema_60'].values.astype(np.float64) if 'strat_ema_60' in df.columns else np.full(len(df), np.nan),
+                'strat_roc_1h': df['strat_roc_1h'].values.astype(np.float64) if 'strat_roc_1h' in df.columns else np.full(len(df), np.nan),
+                'strat_close': df['strat_close'].values.astype(np.float64) if 'strat_close' in df.columns else np.full(len(df), np.nan),
+                'strat_high': df['strat_high'].values.astype(np.float64) if 'strat_high' in df.columns else np.full(len(df), np.nan),
+                'strat_open': df['strat_open'].values.astype(np.float64) if 'strat_open' in df.columns else np.full(len(df), np.nan),
             }
         
         return df
@@ -593,14 +698,19 @@ class BacktestEngine:
         for symbol in symbols_to_close:
             timestamps = self.contract_timestamps.get(symbol)
             df = self.contract_data_cache.get(symbol)
+            position = self.portfolio.get_position(symbol)
             
-            if timestamps is not None and df is not None and len(df) > 0:
+            if timestamps is not None and df is not None and len(df) > 0 and position is not None:
                 # PERFORMANCE: Use numpy searchsorted
                 idx = np.searchsorted(timestamps, end_time_ns, side='right') - 1
                 if idx >= 0:
                     exit_price = df['close'].iloc[idx]
-                    # Apply slippage
-                    exit_price = exit_price * (1 - self.config['slippage_rate'])
+                    # Apply slippage based on position direction
+                    slippage = self.config['slippage_rate']
+                    if position.side == 'LONG':
+                        exit_price = exit_price * (1 - slippage)  # LONG exit: sell, price slips down
+                    else:
+                        exit_price = exit_price * (1 + slippage)  # SHORT exit: buy back, price slips up
                     self.portfolio.close_position(symbol, exit_price, end_time, 'EndOfBacktest')
     
     def _get_trades_dataframe(self) -> pd.DataFrame:

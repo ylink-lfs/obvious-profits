@@ -75,7 +75,8 @@ class BacktestPortfolio:
         self,
         symbol: str,
         entry_price: float,
-        entry_time: pd.Timestamp
+        entry_time: pd.Timestamp,
+        side: str = 'LONG'
     ) -> bool:
         """
         Open a new position.
@@ -84,6 +85,7 @@ class BacktestPortfolio:
             symbol: Contract symbol
             entry_price: Entry price (already includes slippage)
             entry_time: Entry timestamp
+            side: Trade direction ('LONG' or 'SHORT')
             
         Returns:
             True if position was opened successfully
@@ -111,7 +113,9 @@ class BacktestPortfolio:
             entry_time=entry_time,
             size_usd=size_usd,
             size_units=size_units,
-            highest_price=entry_price  # Initialize highest_price for trailing stop
+            side=side,
+            highest_price=entry_price,  # Initialize for LONG trailing stop
+            lowest_price=entry_price    # Initialize for SHORT trailing stop
         )
         
         self.positions[symbol] = position
@@ -142,8 +146,14 @@ class BacktestPortfolio:
         
         position = self.positions[symbol]
         
-        # Calculate PnL
-        price_change = exit_price - position.entry_price
+        # Calculate PnL based on trade direction
+        if position.side == 'LONG':
+            # LONG: profit when price goes up
+            price_change = exit_price - position.entry_price
+        else:
+            # SHORT: profit when price goes down
+            price_change = position.entry_price - exit_price
+            
         gross_pnl = position.size_units * price_change
         
         # Calculate fees (entry + exit)
