@@ -292,7 +292,7 @@ def evaluate_performance(trades_df, balance_df, initial_capital, slippage_rate=0
     
     # Strategy Health Check
     if stats['gross_pnl'] > 0 and stats['total_pnl'] < 0:
-        print("\n*** DIAGNOSIS: Strategy has ALPHA but friction is killing it! ***")
+        print("\n*** DIAGNOSIS: Strategy has strategy but friction is killing it! ***")
         print("    Consider reducing slippage assumption or improving execution.")
     elif stats['gross_pnl'] < 0:
         print("\n*** DIAGNOSIS: Strategy has NO edge even without friction. ***")

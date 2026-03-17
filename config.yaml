@@ -1,0 +1,35 @@
+# CEX Premium Arbitrage Bot Configuration
+
+symbols:
+  - binance_symbol: "powerusdt"
+    gate_symbol: "POWER_USDT"
+
+binance:
+  futures_ws_base: "wss://fstream.binance.com/ws"
+
+gate:
+  futures_ws_base: "wss://fx-ws.gateio.ws/v4/ws/usdt"
+  futures_api_base: "https://api.gateio.ws/api/v4"
+  api_key: ""      # set via environment or fill here
+  api_secret: ""   # set via environment or fill here
+  contract_cache_refresh_minutes: 1  # how often to refresh contract metadata from Gate API
+
+alert:
+  spread_pct_threshold: 1.0       # trigger alert when premium >= 1%
+  funding_apr_threshold: 100.0    # trigger alert when annualized funding >= 100%
+
+risk:
+  left_side_burial_weight: 0.80   # 80% penalty weight for left-side burial risk
+  max_position_usd: 30.0          # Stage 2 hard cap
+  max_impact_cost_pct: 0.5        # reject if cross-level slippage > 0.5%
+
+pricing:
+  budget_usd: 30.0                  # fixed VWAP budget for spread calculation (USD)
+  gate_slippage_pct: 1.0            # S_small: Gate liquidity-pulling penalty (0.5% ~ 2%)
+  binance_slippage_pct: 0.2         # S_binance: Binance execution slippage for hedged path (0.1% ~ 0.3%)
+  gate_taker_fee_pct: 0.075         # Gate futures taker fee rate
+  binance_taker_fee_pct: 0.05       # Binance futures taker fee rate
+  binance_momentum_drift_pct: 0.5   # Path A: expected continued downward drift after right-side break
+  execution_path: "naked_short"     # "naked_short" (Path A) or "hedged" (Path B)
+
+cooldown_seconds: 60              # post-trade cooldown before re-entering same symbol
