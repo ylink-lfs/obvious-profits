@@ -61,7 +61,7 @@ func (c *TheoreticalFundingCalculator) CalcDepthWeightedBuyPrice() (decimal.Deci
 		return decimal.Zero, fmt.Errorf("no ask depth available")
 	}
 
-	return calcDepthWeightedPrice(asks, info.FundingImpactValue, info.QuantoMultiplier)
+	return calcLevelVWAP(asks, info.FundingImpactValue, info.QuantoMultiplier)
 }
 
 // CalcDepthWeightedSellPrice walks bid levels from highest to lowest,
@@ -78,42 +78,7 @@ func (c *TheoreticalFundingCalculator) CalcDepthWeightedSellPrice() (decimal.Dec
 		return decimal.Zero, fmt.Errorf("no bid depth available")
 	}
 
-	return calcDepthWeightedPrice(bids, info.FundingImpactValue, info.QuantoMultiplier)
-}
-
-// calcDepthWeightedPrice walks sorted levels (asks ascending or bids descending),
-// accumulating notional (price * qty * quantoMultiplier) until impactValue USDT is filled.
-// Returns impactValue / totalBaseQty.
-func calcDepthWeightedPrice(levels []memory.Level, impactValue, quantoMultiplier decimal.Decimal) (decimal.Decimal, error) {
-	remaining := impactValue
-	totalBaseQty := decimal.Zero
-
-	for _, level := range levels {
-		// Each level.Qty is in contracts; convert to base currency
-		baseQty, _ := level.Qty.Mul(quantoMultiplier)
-		levelNotional, _ := level.Price.Mul(baseQty)
-
-		if levelNotional.Cmp(remaining) >= 0 {
-			// Partially fill this level
-			partialBase, _ := remaining.Quo(level.Price)
-			totalBaseQty, _ = totalBaseQty.Add(partialBase)
-			remaining = decimal.Zero
-			break
-		}
-
-		totalBaseQty, _ = totalBaseQty.Add(baseQty)
-		remaining, _ = remaining.Sub(levelNotional)
-	}
-
-	if remaining.IsPos() {
-		return decimal.Zero, fmt.Errorf("insufficient depth: $%s unfilled of $%s impact value", remaining, impactValue)
-	}
-
-	price, err := impactValue.Quo(totalBaseQty)
-	if err != nil {
-		return decimal.Zero, fmt.Errorf("depth-weighted price division: %w", err)
-	}
-	return price, nil
+	return calcLevelVWAP(bids, info.FundingImpactValue, info.QuantoMultiplier)
 }
 
 // CalcPremiumIndex computes the premium index from depth-weighted prices and index price.

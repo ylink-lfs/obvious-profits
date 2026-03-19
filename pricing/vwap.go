@@ -29,32 +29,50 @@ func (v *VWAPCalculator) CalcBidVWAP(budgetUSD decimal.Decimal) (decimal.Decimal
 	if len(bids) == 0 {
 		return decimal.Zero, fmt.Errorf("no bid depth available")
 	}
+	return calcLevelVWAP(bids, budgetUSD, decimal.One)
+}
 
+// CalcAskVWAP walks the ask side of the orderbook, filling up to budgetUSD,
+// and returns the volume-weighted average ask price.
+//
+// This represents the realistic average price you would pay when buying
+// (lifting asks) for the given notional amount.
+func (v *VWAPCalculator) CalcAskVWAP(budgetUSD decimal.Decimal) (decimal.Decimal, error) {
+	asks := v.book.TopAsks(50)
+	if len(asks) == 0 {
+		return decimal.Zero, fmt.Errorf("no ask depth available")
+	}
+	return calcLevelVWAP(asks, budgetUSD, decimal.One)
+}
+
+// calcLevelVWAP walks sorted orderbook levels, filling up to budgetUSD of notional,
+// and returns budgetUSD / totalBaseQty — the volume-weighted average price.
+// quantoMultiplier converts level.Qty (contracts) to base currency units;
+// pass decimal.One when qty is already in base currency.
+func calcLevelVWAP(levels []memory.Level, budgetUSD, quantoMultiplier decimal.Decimal) (decimal.Decimal, error) {
 	remaining := budgetUSD
-	totalQty := decimal.Zero
-	totalCost := decimal.Zero
+	totalBaseQty := decimal.Zero
 
-	for _, level := range bids {
-		levelUSD, _ := level.Price.Mul(level.Qty)
-		fill := remaining
-		if levelUSD.Cmp(fill) < 0 {
-			fill = levelUSD
-		}
-		qty, _ := fill.Quo(level.Price)
-		totalQty, _ = totalQty.Add(qty)
-		cost, _ := qty.Mul(level.Price)
-		totalCost, _ = totalCost.Add(cost)
-		remaining, _ = remaining.Sub(fill)
-		if !remaining.IsPos() {
+	for _, level := range levels {
+		baseQty, _ := level.Qty.Mul(quantoMultiplier)
+		levelNotional, _ := level.Price.Mul(baseQty)
+
+		if levelNotional.Cmp(remaining) >= 0 {
+			partialBase, _ := remaining.Quo(level.Price)
+			totalBaseQty, _ = totalBaseQty.Add(partialBase)
+			remaining = decimal.Zero
 			break
 		}
+
+		totalBaseQty, _ = totalBaseQty.Add(baseQty)
+		remaining, _ = remaining.Sub(levelNotional)
 	}
 
 	if remaining.IsPos() {
-		return decimal.Zero, fmt.Errorf("insufficient bid depth: $%s unfilled of $%s", remaining, budgetUSD)
+		return decimal.Zero, fmt.Errorf("insufficient depth: $%s unfilled of $%s", remaining, budgetUSD)
 	}
 
-	vwap, err := totalCost.Quo(totalQty)
+	vwap, err := budgetUSD.Quo(totalBaseQty)
 	if err != nil {
 		return decimal.Zero, fmt.Errorf("vwap division: %w", err)
 	}

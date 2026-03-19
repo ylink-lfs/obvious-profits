@@ -21,18 +21,7 @@ func NewL2Book() *L2Book {
 }
 
 func (b *L2Book) Apply(u core.L2Update) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	book := b.bids
-	if u.Side == core.SideAsk {
-		book = b.asks
-	}
-	key := u.Price.String()
-	if u.Qty.IsZero() {
-		delete(book, key)
-	} else {
-		book[key] = Level{Price: u.Price, Qty: u.Qty}
-	}
+	panic("not implemented: incremental updates not yet supported")
 }
 
 type Level struct {
