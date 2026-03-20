@@ -15,6 +15,7 @@ type Config struct {
 	Alert    AlertConfig   `yaml:"alert"`
 	Risk     RiskConfig    `yaml:"risk"`
 	Pricing  PricingConfig `yaml:"pricing"`
+	Funding  FundingConfig `yaml:"funding"`
 	Cooldown int           `yaml:"cooldown_seconds"`
 }
 
@@ -36,8 +37,16 @@ type GateConfig struct {
 }
 
 type AlertConfig struct {
-	SpreadPctThreshold  decimal.Decimal `yaml:"spread_pct_threshold"`
-	FundingAPRThreshold decimal.Decimal `yaml:"funding_apr_threshold"`
+	SpreadPctThreshold decimal.Decimal `yaml:"spread_pct_threshold"`
+	ESIThreshold       decimal.Decimal `yaml:"esi_threshold"`
+}
+
+type FundingConfig struct {
+	PollIntervalSeconds int             `yaml:"poll_interval_seconds"`
+	RPRWindowDays       int             `yaml:"rpr_window_days"`
+	ESIThreshold        decimal.Decimal `yaml:"esi_threshold"`
+	RPRThreshold        decimal.Decimal `yaml:"rpr_threshold"`
+	SRThreshold         decimal.Decimal `yaml:"sr_threshold"`
 }
 
 type RiskConfig struct {

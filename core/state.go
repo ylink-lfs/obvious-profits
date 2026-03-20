@@ -40,30 +40,25 @@ type PriceState struct {
 	GateAsk                 AtomicPrice
 	GateBid                 AtomicPrice
 	GateIndexPrice          AtomicPrice // real-time index price from futures.tickers WS
+	WsFundingRate           AtomicPrice // discrete funding_rate from futures.tickers WS
 	WsIndicativeFundingRate AtomicPrice // exchange-reported indicative funding rate from futures.tickers WS
 }
 
-// TheoreticalFundingState holds the latest theoretical funding rate for Gate.
-type TheoreticalFundingState struct {
-	mu   sync.RWMutex
-	rate decimal.Decimal
-	ts   atomic.Int64
+// FundingSignalState holds the latest FundingSignal for thread-safe reads.
+type FundingSignalState struct {
+	mu     sync.RWMutex
+	signal FundingSignal
 }
 
-func (f *TheoreticalFundingState) Store(rate decimal.Decimal) {
+func (f *FundingSignalState) Store(sig FundingSignal) {
 	f.mu.Lock()
-	f.rate = rate
+	f.signal = sig
 	f.mu.Unlock()
-	f.ts.Store(time.Now().UnixNano())
 }
 
-func (f *TheoreticalFundingState) Load() decimal.Decimal {
+func (f *FundingSignalState) Load() FundingSignal {
 	f.mu.RLock()
-	r := f.rate
+	s := f.signal
 	f.mu.RUnlock()
-	return r
-}
-
-func (f *TheoreticalFundingState) LastUpdate() time.Time {
-	return time.Unix(0, f.ts.Load())
+	return s
 }

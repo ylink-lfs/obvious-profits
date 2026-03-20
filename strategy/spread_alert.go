@@ -12,26 +12,26 @@ import (
 )
 
 // SpreadAlert monitors Binance and Gate ticker streams, computes
-// clock-aligned spread, checks funding rate extremes, and emits
+// clock-aligned spread, checks funding ESI extremes, and emits
 // SpreadSnapshot alerts when thresholds are breached.
 type SpreadAlert struct {
 	cfg        config.AlertConfig
 	binanceCh  <-chan core.Ticker
 	gateCh     <-chan core.Ticker
-	fundingCh  <-chan core.TheoreticalFundingRate
+	fundingCh  <-chan core.FundingSignal
 	alertCh    chan<- core.SpreadSnapshot
 	priceState *core.PriceState
-	fundState  *core.TheoreticalFundingState
+	fundState  *core.FundingSignalState
 }
 
 func NewSpreadAlert(
 	cfg config.AlertConfig,
 	binanceCh <-chan core.Ticker,
 	gateCh <-chan core.Ticker,
-	fundingCh <-chan core.TheoreticalFundingRate,
+	fundingCh <-chan core.FundingSignal,
 	alertCh chan<- core.SpreadSnapshot,
 	priceState *core.PriceState,
-	fundState *core.TheoreticalFundingState,
+	fundState *core.FundingSignalState,
 ) *SpreadAlert {
 	return &SpreadAlert{
 		cfg:        cfg,
@@ -58,10 +58,12 @@ func (s *SpreadAlert) Run(ctx context.Context) error {
 			s.priceState.GateAsk.Store(t.Ask)
 			s.priceState.GateBid.Store(t.Bid)
 			s.checkAndEmit(ctx, t.Symbol)
-		case fr := <-s.fundingCh:
-			s.fundState.Store(fr.TheoreticalRate)
-			if fr.AnnualizedAPR.Abs().Cmp(s.cfg.FundingAPRThreshold) >= 0 {
-				slog.Warn("[SpreadAlert] theoretical funding rate extreme", "apr", fr.AnnualizedAPR, "premium_index", fr.PremiumIndex)
+		case sig := <-s.fundingCh:
+			s.fundState.Store(sig)
+			if sig.ESI.Cmp(s.cfg.ESIThreshold) >= 0 {
+				slog.Warn("[SpreadAlert] extreme funding ESI",
+					"esi", sig.ESI, "rpr", sig.RPR, "sr", sig.SR,
+					"funding_rate", sig.FundingRate, "kappa", sig.Kappa)
 			}
 		}
 	}
@@ -77,10 +79,9 @@ func (s *SpreadAlert) checkAndEmit(ctx context.Context, symbol string) {
 	diff, _ := gateBid.Sub(binanceAsk)
 	spreadPct, _ := diff.Quo(binanceAsk)
 	spreadPct, _ = spreadPct.Mul(decimal.Hundred)
-	fundingRate := s.fundState.Load()
-	fundingAPR, _ := fundingRate.Mul(decimal.MustParse("109500")) // 365 * 3 * 100
+	fundSig := s.fundState.Load()
 
-	if spreadPct.Abs().Cmp(s.cfg.SpreadPctThreshold) < 0 && fundingAPR.Abs().Cmp(s.cfg.FundingAPRThreshold) < 0 {
+	if spreadPct.Abs().Cmp(s.cfg.SpreadPctThreshold) < 0 && fundSig.ESI.Cmp(s.cfg.ESIThreshold) < 0 {
 		return
 	}
 
@@ -89,10 +90,10 @@ func (s *SpreadAlert) checkAndEmit(ctx context.Context, symbol string) {
 		BinanceAsk:  binanceAsk,
 		GateBid:     gateBid,
 		SpreadPct:   spreadPct,
-		FundingRate: fundingRate,
+		FundingRate: fundSig.FundingRate,
 		Ts:          time.Now(),
 	}
-	slog.Warn("[SpreadAlert] ALERT", "spread_pct", spreadPct, "funding_rate", fundingRate)
+	slog.Warn("[SpreadAlert] ALERT", "spread_pct", spreadPct, "funding_rate", fundSig.FundingRate, "esi", fundSig.ESI)
 
 	select {
 	case s.alertCh <- snap:

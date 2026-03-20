@@ -4,177 +4,72 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/govalues/decimal"
 
+	"obvious-profits/config"
 	"obvious-profits/core"
 	"obvious-profits/feed"
-	"obvious-profits/memory"
+	"obvious-profits/utils"
 )
 
-// TheoreticalFundingCalculator computes real-time theoretical funding rate
-// from local orderbook depth-weighted prices and websocket-streamed index price.
-//
-// The result is intentionally unclipped (no fmax/fmin clamping) — it reflects
-// the true market-implied directional pressure, not the exchange's capped rate.
-type TheoreticalFundingCalculator struct {
-	symbol     string
-	book       *memory.L2Book
-	indexPrice *core.AtomicPrice
-	contracts  *feed.ContractCache
-	out        chan<- core.TheoreticalFundingRate
+var one = decimal.One
 
-	mu   sync.Mutex
-	ring *premiumRing
+// FundingMonitor samples the funding rate every poll interval, preferring the
+// real-time WS feed (futures.tickers) and falling back to the REST-cached
+// ContractCache when the WS stream is stale (>30 s without a message).
+// It computes RPR + SR, fuses them into ESI via cold-start-aware dynamic
+// weighting, and emits FundingSignal events.
+// ESI: Extreme Sentiment Index, a fused funding extremeness score in [0, 1].
+// RPR: Rolling Percentile Rank of the current funding rate within the recent window.
+// SR: Saturation Ratio, the absolute funding rate as a fraction of the maximum (C_max).
+// κ: Data confidence coefficient, a function of the ring buffer fill level that governs the dynamic weighting between RPR and SR.
+type FundingMonitor struct {
+	symbol        string
+	contracts     *feed.ContractCache
+	wsFundingRate *core.AtomicPrice // real-time funding_rate from WS
+	buf           *utils.RollingPercentile
+	cfg           config.FundingConfig
+	nTarget       int // RPRWindowDays * 1440
+	out           chan<- core.FundingSignal
 }
 
-func NewTheoreticalFundingCalculator(
+const wsStalenessThreshold = 30 * time.Second
+
+func NewFundingMonitor(
 	symbol string,
-	book *memory.L2Book,
-	indexPrice *core.AtomicPrice,
 	contracts *feed.ContractCache,
-	out chan<- core.TheoreticalFundingRate,
-) *TheoreticalFundingCalculator {
-	return &TheoreticalFundingCalculator{
-		symbol:     symbol,
-		book:       book,
-		indexPrice: indexPrice,
-		contracts:  contracts,
-		out:        out,
+	wsFundingRate *core.AtomicPrice,
+	cfg config.FundingConfig,
+	out chan<- core.FundingSignal,
+) *FundingMonitor {
+	if cfg.PollIntervalSeconds <= 0 {
+		cfg.PollIntervalSeconds = 60
+	}
+	if cfg.RPRWindowDays <= 0 {
+		cfg.RPRWindowDays = 14
+	}
+	nTarget := cfg.RPRWindowDays * 24 * 60 // 1-minute samples per window
+	return &FundingMonitor{
+		symbol:        symbol,
+		contracts:     contracts,
+		wsFundingRate: wsFundingRate,
+		buf:           utils.NewRollingPercentile(nTarget),
+		cfg:           cfg,
+		nTarget:       nTarget,
+		out:           out,
 	}
 }
 
-// CalcDepthWeightedBuyPrice walks ask levels from lowest to highest,
-// accumulating notional until funding_impact_value (USDT) is reached.
-// Returns impact_value / total_base_qty — the depth-weighted average buy price.
-func (c *TheoreticalFundingCalculator) CalcDepthWeightedBuyPrice() (decimal.Decimal, error) {
-	info, ok := c.contracts.Get(c.symbol)
-	if !ok {
-		return decimal.Zero, fmt.Errorf("contract %s not found in cache", c.symbol)
-	}
+// Run starts the periodic funding rate sampling loop.
+func (m *FundingMonitor) Run(ctx context.Context) error {
+	slog.Info("[FundingMonitor] starting", "symbol", m.symbol,
+		"poll_interval_s", m.cfg.PollIntervalSeconds,
+		"rpr_window_days", m.cfg.RPRWindowDays,
+		"n_target", m.nTarget)
 
-	asks := c.book.TopAsks(50)
-	if len(asks) == 0 {
-		return decimal.Zero, fmt.Errorf("no ask depth available")
-	}
-
-	return calcLevelVWAP(asks, info.FundingImpactValue, info.QuantoMultiplier)
-}
-
-// CalcDepthWeightedSellPrice walks bid levels from highest to lowest,
-// accumulating notional until funding_impact_value (USDT) is reached.
-// Returns impact_value / total_base_qty — the depth-weighted average sell price.
-func (c *TheoreticalFundingCalculator) CalcDepthWeightedSellPrice() (decimal.Decimal, error) {
-	info, ok := c.contracts.Get(c.symbol)
-	if !ok {
-		return decimal.Zero, fmt.Errorf("contract %s not found in cache", c.symbol)
-	}
-
-	bids := c.book.TopBids(50)
-	if len(bids) == 0 {
-		return decimal.Zero, fmt.Errorf("no bid depth available")
-	}
-
-	return calcLevelVWAP(bids, info.FundingImpactValue, info.QuantoMultiplier)
-}
-
-// CalcPremiumIndex computes the premium index from depth-weighted prices and index price.
-// Formula: [Max(0, buyPrice - indexPrice) - Max(0, indexPrice - sellPrice)] / indexPrice
-func (c *TheoreticalFundingCalculator) CalcPremiumIndex() (decimal.Decimal, error) {
-	idx := c.indexPrice.Load()
-	if !idx.IsPos() {
-		return decimal.Zero, fmt.Errorf("index price not available")
-	}
-
-	buyPrice, err := c.CalcDepthWeightedBuyPrice()
-	if err != nil {
-		return decimal.Zero, fmt.Errorf("buy price: %w", err)
-	}
-
-	sellPrice, err := c.CalcDepthWeightedSellPrice()
-	if err != nil {
-		return decimal.Zero, fmt.Errorf("sell price: %w", err)
-	}
-
-	// Max(0, buyPrice - indexPrice)
-	buyDiff, _ := buyPrice.Sub(idx)
-	if buyDiff.IsNeg() {
-		buyDiff = decimal.Zero
-	}
-
-	// Max(0, indexPrice - sellPrice)
-	sellDiff, _ := idx.Sub(sellPrice)
-	if sellDiff.IsNeg() {
-		sellDiff = decimal.Zero
-	}
-
-	numerator, _ := buyDiff.Sub(sellDiff)
-	premium, err := numerator.Quo(idx)
-	if err != nil {
-		return decimal.Zero, fmt.Errorf("premium index division: %w", err)
-	}
-	return premium, nil
-}
-
-var (
-	clampHigh = decimal.MustParse("0.0005")
-	clampLow  = decimal.MustParse("-0.0005")
-)
-
-// CalcTheoreticalFundingRate computes the theoretical (unclipped) funding rate.
-// Formula: avg(premium_indices) + clamp(interest_rate - avg_premium, -0.0005, 0.0005)
-// No fmax/fmin clamping is applied.
-func (c *TheoreticalFundingCalculator) CalcTheoreticalFundingRate() (decimal.Decimal, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.ring == nil || c.ring.count == 0 {
-		return decimal.Zero, fmt.Errorf("no premium index samples collected yet")
-	}
-
-	avgPremium := c.ring.Average()
-
-	info, ok := c.contracts.Get(c.symbol)
-	if !ok {
-		return decimal.Zero, fmt.Errorf("contract %s not found in cache", c.symbol)
-	}
-
-	// clamp(interest_rate - avg_premium, -0.0005, 0.0005)
-	diff, _ := info.InterestRate.Sub(avgPremium)
-	clamped := clamp(diff, clampLow, clampHigh)
-
-	rate, _ := avgPremium.Add(clamped)
-	return rate, nil
-}
-
-func clamp(v, lo, hi decimal.Decimal) decimal.Decimal {
-	if v.Cmp(lo) < 0 {
-		return lo
-	}
-	if v.Cmp(hi) > 0 {
-		return hi
-	}
-	return v
-}
-
-// Run samples premium index every 60 seconds and emits TheoreticalFundingRate events.
-func (c *TheoreticalFundingCalculator) Run(ctx context.Context) error {
-	slog.Info("[TheoFunding] starting", "symbol", c.symbol)
-
-	// Initialize ring buffer based on funding interval
-	info, ok := c.contracts.Get(c.symbol)
-	ringSize := 480 // default: 8h / 60s
-	if ok && info.FundingInterval > 0 {
-		ringSize = info.FundingInterval / 60
-	}
-	c.mu.Lock()
-	c.ring = newPremiumRing(ringSize)
-	c.mu.Unlock()
-
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(time.Duration(m.cfg.PollIntervalSeconds) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -182,94 +77,127 @@ func (c *TheoreticalFundingCalculator) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			c.sampleAndEmit(ctx)
+			m.sampleAndEmit(ctx)
 		}
 	}
 }
 
-func (c *TheoreticalFundingCalculator) sampleAndEmit(ctx context.Context) {
-	premium, err := c.CalcPremiumIndex()
+func (m *FundingMonitor) sampleAndEmit(ctx context.Context) {
+	// Always need ContractCache for cMax (funding_rate_limit) — WS doesn't provide it.
+	info, ok := m.contracts.Get(m.symbol)
+	if !ok {
+		slog.Debug("[FundingMonitor] contract not in cache", "symbol", m.symbol)
+		return
+	}
+	cMax := info.FundingRateLimit // funding_rate_limit (C_max)
+
+	// Prefer WS funding_rate; fall back to REST if WS stream is stale.
+	var ft decimal.Decimal
+	var source string
+	if m.wsFundingRate != nil && time.Since(m.wsFundingRate.LastUpdate()) <= wsStalenessThreshold {
+		ft = m.wsFundingRate.Load()
+		source = "ws"
+	} else {
+		ft = info.FundingRate
+		source = "rest"
+	}
+
+	// Push into ring buffer
+	m.buf.Push(ft)
+	n := m.buf.Count()
+
+	// SR: |F_t / C_max|, clamped to [0, 1]
+	sr, err := m.calcSR(ft, cMax)
 	if err != nil {
-		slog.Debug("[TheoFunding] premium index unavailable", "error", err)
+		slog.Debug("[FundingMonitor] SR calc failed", "error", err)
 		return
 	}
 
-	c.mu.Lock()
-	c.ring.Push(premium)
-	c.mu.Unlock()
+	// RPR: rolling percentile rank [0, 1]
+	rpr := m.buf.PercentileRank(ft)
 
-	rate, err := c.CalcTheoreticalFundingRate()
-	if err != nil {
-		slog.Debug("[TheoFunding] funding rate unavailable", "error", err)
-		return
+	// κ = min(1, N/N_target)²
+	kappa := m.calcKappa(n)
+
+	// ESI = W_RPR * RPR + W_SR * SR
+	// W_RPR = 0.5 * κ, W_SR = 1.0 - 0.5 * κ
+	esi := m.calcESI(rpr, sr, kappa)
+
+	sig := core.FundingSignal{
+		Symbol:      m.symbol,
+		FundingRate: ft,
+		RateLimit:   cMax,
+		RPR:         rpr,
+		SR:          sr,
+		ESI:         esi,
+		Kappa:       kappa,
+		SampleCount: n,
+		Ts:          time.Now().Truncate(time.Minute),
 	}
 
-	// Annualize: rate * (8760 / intervalHours) * 100
-	info, ok := c.contracts.Get(c.symbol)
-	intervalHours := 8
-	if ok && info.FundingInterval > 0 {
-		intervalHours = info.FundingInterval / 3600
-	}
-	intervalsPerYear, _ := decimal.MustParse("8760").Quo(decimal.MustParse(strconv.Itoa(intervalHours)))
-	apr, _ := rate.Mul(intervalsPerYear)
-	apr, _ = apr.Mul(decimal.Hundred)
-
-	now := time.Now()
-	event := core.TheoreticalFundingRate{
-		Symbol:          c.symbol,
-		TheoreticalRate: rate,
-		PremiumIndex:    premium,
-		AnnualizedAPR:   apr,
-		ExchangeTs:      now,
-		LocalTs:         now,
-	}
-
-	slog.Info("[TheoFunding] sample",
-		"symbol", c.symbol,
-		"premium_index", premium,
-		"theo_rate", rate,
-		"apr", apr)
+	slog.Info("[FundingMonitor] sample",
+		"symbol", m.symbol,
+		"source", source,
+		"funding_rate", ft,
+		"rate_limit", cMax,
+		"sr", sr,
+		"rpr", rpr,
+		"kappa", kappa,
+		"esi", esi,
+		"samples", n)
 
 	select {
-	case c.out <- event:
+	case m.out <- sig:
 	case <-ctx.Done():
 	}
 }
 
-// premiumRing is a fixed-size circular buffer of premium index samples.
-type premiumRing struct {
-	buf   []decimal.Decimal
-	size  int
-	pos   int
-	count int
+// calcSR computes the saturation ratio: |F_t / C_max|, clamped to [0, 1].
+func (m *FundingMonitor) calcSR(ft, cMax decimal.Decimal) (decimal.Decimal, error) {
+	if cMax.IsZero() {
+		return decimal.Zero, fmt.Errorf("funding_rate_limit is zero")
+	}
+	ratio, err := ft.Quo(cMax)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	sr := ratio.Abs()
+	if sr.Cmp(one) > 0 {
+		sr = one
+	}
+	return sr, nil
 }
 
-func newPremiumRing(size int) *premiumRing {
-	if size <= 0 {
-		size = 480
+// calcKappa computes the data confidence coefficient: min(1, N/N_target)².
+func (m *FundingMonitor) calcKappa(n int) decimal.Decimal {
+	if m.nTarget <= 0 {
+		return one
 	}
-	return &premiumRing{
-		buf:  make([]decimal.Decimal, size),
-		size: size,
+	dN, _ := decimal.New(int64(n), 0)
+	dTarget, _ := decimal.New(int64(m.nTarget), 0)
+	ratio, _ := dN.Quo(dTarget)
+	if ratio.Cmp(one) > 0 {
+		ratio = one
 	}
+	kappa, _ := ratio.Mul(ratio) // ratio²
+	return kappa
 }
 
-func (r *premiumRing) Push(v decimal.Decimal) {
-	r.buf[r.pos] = v
-	r.pos = (r.pos + 1) % r.size
-	if r.count < r.size {
-		r.count++
-	}
-}
+// calcESI computes the Extreme Sentiment Index:
+//
+//	W_RPR = 0.5 * κ
+//	W_SR  = 1.0 - 0.5 * κ
+//	ESI   = W_RPR * RPR + W_SR * SR
+func (m *FundingMonitor) calcESI(rpr, sr, kappa decimal.Decimal) decimal.Decimal {
+	half := decimal.MustParse("0.5")
+	halfKappa, _ := half.Mul(kappa) // 0.5 * κ
 
-func (r *premiumRing) Average() decimal.Decimal {
-	if r.count == 0 {
-		return decimal.Zero
-	}
-	sum := decimal.Zero
-	for i := 0; i < r.count; i++ {
-		sum, _ = sum.Add(r.buf[i])
-	}
-	avg, _ := sum.Quo(decimal.MustParse(strconv.Itoa(r.count)))
-	return avg
+	wRPR := halfKappa            // W_RPR
+	wSR, _ := one.Sub(halfKappa) // W_SR = 1.0 - 0.5 * κ
+
+	rprTerm, _ := wRPR.Mul(rpr) // W_RPR * RPR
+	srTerm, _ := wSR.Mul(sr)    // W_SR  * SR
+
+	esi, _ := rprTerm.Add(srTerm)
+	return esi
 }

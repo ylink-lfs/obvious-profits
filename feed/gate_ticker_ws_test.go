@@ -2,7 +2,6 @@ package feed
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -10,6 +9,8 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/lxzan/gws"
 	"golang.org/x/net/proxy"
+
+	"obvious-profits/utils"
 )
 
 type gateTickerRawPrinter struct {
@@ -34,8 +35,7 @@ func (h *gateTickerRawPrinter) OnOpen(socket *gws.Conn) {
 }
 
 func (h *gateTickerRawPrinter) OnClose(_ *gws.Conn, err error) {
-	var ce *gws.CloseError
-	if err != nil && !(errors.As(err, &ce) && ce.Code == 1000) {
+	if err != nil && !utils.IsNormalWSClose(err) {
 		fmt.Printf("[GateTickerWS] closed with error: %v\n", err)
 	}
 	close(h.done)

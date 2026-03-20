@@ -12,11 +12,18 @@ gate:
   futures_api_base: "https://api.gateio.ws/api/v4"
   api_key: ""      # set via environment or fill here
   api_secret: ""   # set via environment or fill here
-  contract_cache_refresh_minutes: 1  # how often to refresh contract metadata from Gate API
+  contract_cache_refresh_minutes: 5  # how often to refresh contract metadata from Gate API
 
 alert:
   spread_pct_threshold: 1.0       # trigger alert when premium >= 1%
-  funding_apr_threshold: 100.0    # trigger alert when annualized funding >= 100%
+  esi_threshold: 0.85             # trigger alert when ESI >= 0.85
+
+funding:
+  poll_interval_seconds: 60       # how often to sample funding rate from contract cache
+  rpr_window_days: 14             # rolling percentile rank window (14 days = 20160 samples)
+  esi_threshold: 0.85             # extreme sentiment index threshold
+  rpr_threshold: 0.995            # RPR standalone threshold (99.5th percentile)
+  sr_threshold: 0.85              # saturation ratio standalone threshold
 
 risk:
   left_side_burial_weight: 0.80   # 80% penalty weight for left-side burial risk

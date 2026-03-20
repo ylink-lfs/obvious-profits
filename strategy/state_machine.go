@@ -17,7 +17,7 @@ type StateMachine struct {
 	cooldown      time.Duration
 	alertIn       <-chan core.SpreadSnapshot
 	riskCheck     func(core.SpreadSnapshot) bool
-	ringBuf       *RingBuffer
+	detector      *MomentumDetector
 	triggerOut    chan<- core.TriggerSignal
 	cooldownUntil time.Time
 }
@@ -27,7 +27,7 @@ func NewStateMachine(
 	cooldown time.Duration,
 	alertIn <-chan core.SpreadSnapshot,
 	riskCheck func(core.SpreadSnapshot) bool,
-	ringBuf *RingBuffer,
+	detector *MomentumDetector,
 	triggerOut chan<- core.TriggerSignal,
 ) *StateMachine {
 	return &StateMachine{
@@ -36,7 +36,7 @@ func NewStateMachine(
 		cooldown:   cooldown,
 		alertIn:    alertIn,
 		riskCheck:  riskCheck,
-		ringBuf:    ringBuf,
+		detector:   detector,
 		triggerOut: triggerOut,
 	}
 }
@@ -65,7 +65,7 @@ func (sm *StateMachine) onAlert(ctx context.Context, snap core.SpreadSnapshot) {
 			return
 		}
 		sm.transition(core.StateAlert)
-		sm.ringBuf.Push(snap)
+		sm.detector.Push(snap)
 		sm.transition(core.StateRiskCheck)
 		if sm.riskCheck(snap) {
 			sm.transition(core.StateArmed)
@@ -75,7 +75,7 @@ func (sm *StateMachine) onAlert(ctx context.Context, snap core.SpreadSnapshot) {
 			sm.transition(core.StateIdle)
 		}
 	case core.StateArmed:
-		sm.ringBuf.Push(snap)
+		sm.detector.Push(snap)
 	}
 }
 
@@ -83,7 +83,7 @@ func (sm *StateMachine) onTick(ctx context.Context) {
 	if sm.state != core.StateArmed {
 		return
 	}
-	signal := sm.ringBuf.DetectMomentumExhaustion(sm.symbol)
+	signal := sm.detector.Detect(sm.symbol)
 	if signal == nil {
 		return
 	}

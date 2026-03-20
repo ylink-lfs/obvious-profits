@@ -32,13 +32,13 @@ func main() {
 
 	// Shared state
 	priceState := &core.PriceState{}
-	theoFundState := &core.TheoreticalFundingState{}
+	fundState := &core.FundingSignalState{}
 	book := memory.NewL2Book()
 
 	// Channels
 	binanceCh := make(chan core.Ticker, 64)
 	gateCh := make(chan core.Ticker, 64)
-	fundingCh := make(chan core.TheoreticalFundingRate, 16)
+	fundingCh := make(chan core.FundingSignal, 16)
 	alertCh := make(chan core.SpreadSnapshot, 16)
 	triggerCh := make(chan core.TriggerSignal, 4)
 
@@ -46,7 +46,7 @@ func main() {
 	binanceAsk := &core.AtomicPrice{}
 	binanceTickerWS := feed.NewBinanceTickerWS(cfg.Binance.FuturesWSBase, sym.BinanceSymbol, binanceCh, binanceAsk)
 	gateTickerWS := feed.NewGateTickerWS(cfg.Gate.FuturesWSBase, sym.GateSymbol, gateCh,
-		&priceState.GateIndexPrice, &priceState.WsIndicativeFundingRate)
+		&priceState.GateIndexPrice, &priceState.WsIndicativeFundingRate, &priceState.WsFundingRate)
 
 	// Contract cache: fetches all Gate USDT contracts periodically
 	refreshMin := cfg.Gate.ContractCacheRefreshMinutes
@@ -55,17 +55,17 @@ func main() {
 	}
 	contractCache := feed.NewContractCache(cfg.Gate.FuturesAPIBase, time.Duration(refreshMin)*time.Minute)
 
-	// Theoretical funding rate calculator (replaces old REST polling)
-	theoFundCalc := pricing.NewTheoreticalFundingCalculator(
-		sym.GateSymbol, book, &priceState.GateIndexPrice, contractCache, fundingCh,
+	// Funding monitor: reads discrete funding_rate from WS (primary) or contract cache (fallback)
+	fundingMon := pricing.NewFundingMonitor(
+		sym.GateSymbol, contractCache, &priceState.WsFundingRate, cfg.Funding, fundingCh,
 	)
 
-	spreadAlert := strategy.NewSpreadAlert(cfg.Alert, binanceCh, gateCh, fundingCh, alertCh, priceState, theoFundState)
+	spreadAlert := strategy.NewSpreadAlert(cfg.Alert, binanceCh, gateCh, fundingCh, alertCh, priceState, fundState)
 	gateKeeper := risk.NewGateKeeper(cfg.Risk)
 	impactCost := risk.NewImpactCost(cfg.Risk, book)
 	tracker := execution.NewLatencyTracker(sym.GateSymbol)
 	gateAPI := execution.NewGateAPI(cfg.Gate, tracker)
-	ringBuf := strategy.NewRingBuffer(30)
+	detector := strategy.NewMomentumDetector(30)
 
 	// Pricing modules: orderbook sync, VWAP, spread calculator
 	gateOB := feed.NewGateOrderbookWS(cfg.Gate.FuturesWSBase, sym.GateSymbol, book)
@@ -75,7 +75,7 @@ func main() {
 	cooldown := time.Duration(cfg.Cooldown) * time.Second
 	stateMachine := strategy.NewStateMachine(
 		sym.GateSymbol, cooldown, alertCh,
-		gateKeeper.Check, ringBuf, triggerCh,
+		gateKeeper.Check, detector, triggerCh,
 	)
 
 	// Context with graceful shutdown
@@ -112,8 +112,8 @@ func main() {
 		}
 	}()
 	go func() {
-		if err := theoFundCalc.Run(ctx); err != nil {
-			slog.Error("[Engine] theoretical funding calc error", "error", err)
+		if err := fundingMon.Run(ctx); err != nil {
+			slog.Error("[Engine] funding monitor error", "error", err)
 		}
 	}()
 	go func() {

@@ -2,13 +2,14 @@ package feed
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/lxzan/gws"
 	"golang.org/x/net/proxy"
+
+	"obvious-profits/utils"
 )
 
 type binanceRawPrinter struct {
@@ -23,8 +24,7 @@ func (h *binanceRawPrinter) OnOpen(_ *gws.Conn) {
 }
 
 func (h *binanceRawPrinter) OnClose(_ *gws.Conn, err error) {
-	var ce *gws.CloseError
-	if err != nil && !(errors.As(err, &ce) && ce.Code == 1000) {
+	if err != nil && !utils.IsNormalWSClose(err) {
 		fmt.Printf("[BinanceTickerWS] closed with error: %v\n", err)
 	}
 	close(h.done)

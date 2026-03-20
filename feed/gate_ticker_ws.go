@@ -20,23 +20,25 @@ import (
 // and storing index/funding fields into the provided AtomicPrice pointers.
 type GateTickerWS struct {
 	gws.BuiltinEventHandler
-	baseURL    string
-	symbol     string
-	out        chan<- core.Ticker
-	indexPrice *core.AtomicPrice // populated from futures.tickers
-	indicative *core.AtomicPrice // populated from futures.tickers
-	ctx        context.Context
-	done       chan struct{}
-	connErr    chan error
+	baseURL     string
+	symbol      string
+	out         chan<- core.Ticker
+	indexPrice  *core.AtomicPrice // populated from futures.tickers
+	indicative  *core.AtomicPrice // populated from futures.tickers
+	fundingRate *core.AtomicPrice // discrete funding_rate from futures.tickers
+	ctx         context.Context
+	done        chan struct{}
+	connErr     chan error
 }
 
-func NewGateTickerWS(baseURL, symbol string, out chan<- core.Ticker, indexPrice, indicative *core.AtomicPrice) *GateTickerWS {
+func NewGateTickerWS(baseURL, symbol string, out chan<- core.Ticker, indexPrice, indicative, fundingRate *core.AtomicPrice) *GateTickerWS {
 	return &GateTickerWS{
-		baseURL:    baseURL,
-		symbol:     symbol,
-		out:        out,
-		indexPrice: indexPrice,
-		indicative: indicative,
+		baseURL:     baseURL,
+		symbol:      symbol,
+		out:         out,
+		indexPrice:  indexPrice,
+		indicative:  indicative,
+		fundingRate: fundingRate,
 	}
 }
 
@@ -107,6 +109,7 @@ func (g *GateTickerWS) OnClose(socket *gws.Conn, err error) {
 type gateTickersResult struct {
 	Contract              string `json:"contract"`
 	IndexPrice            string `json:"index_price"`
+	FundingRate           string `json:"funding_rate"`
 	FundingRateIndicative string `json:"funding_rate_indicative"`
 }
 
@@ -187,6 +190,11 @@ func (g *GateTickerWS) handleTickers(raw json.RawMessage) {
 		if r.IndexPrice != "" {
 			if p, err := decimal.Parse(r.IndexPrice); err == nil {
 				g.indexPrice.Store(p)
+			}
+		}
+		if r.FundingRate != "" {
+			if p, err := decimal.Parse(r.FundingRate); err == nil {
+				g.fundingRate.Store(p)
 			}
 		}
 		if r.FundingRateIndicative != "" {
