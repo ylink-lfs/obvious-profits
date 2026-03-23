@@ -62,6 +62,9 @@ type RollingPercentile struct {
 }
 
 func NewRollingPercentile(size int) *RollingPercentile {
+	if size <= 0 {
+		panic("NewRollingPercentile: size must be positive")
+	}
 	return &RollingPercentile{
 		queue: make([]int, size),
 		size:  size,
@@ -114,11 +117,20 @@ func (b *RollingPercentile) Count() int {
 	return n
 }
 
-// PercentileRank returns the fraction of stored samples that are strictly
-// less than value (signed comparison), as a decimal in [0, 1].
+// PercentileRank returns the midrank percentile rank of value within the
+// stored sample distribution, as a decimal in [0, 1].
+//
+// Uses the standard midrank formula for tied discrete values:
+//
+//	PR = (Below + 0.5 × Ties) / N  =  (2·Below + Ties) / (2·N)
+//
+// This avoids the "baseline trap": when all samples equal the query (e.g.
+// a funding rate pinned at the default 0.0100%), the rank is 0.5 (neutral)
+// rather than 0 (which would falsely signal extreme short crowding).
+//
 // High RPR (→1) = current rate exceeds most historical samples (long crowding).
 // Low RPR (→0) = current rate is below most historical samples (short crowding).
-// Uses the Fenwick tree for O(log M) prefix-sum query (M = 100001 buckets).
+// Uses the Fenwick tree for O(log M) prefix-sum queries (M = 100001 buckets).
 func (b *RollingPercentile) PercentileRank(value decimal.Decimal) decimal.Decimal {
 	b.mu.RLock()
 	n := b.n
@@ -128,12 +140,13 @@ func (b *RollingPercentile) PercentileRank(value decimal.Decimal) decimal.Decima
 	}
 
 	queryBucket := rateToBucket(value)
-	// Count samples in buckets [0, queryBucket-1] (strictly less than value).
 	below := b.fenwickQuery(queryBucket - 1)
+	atBucket := b.fenwickQuery(queryBucket) - below // ties in same bucket
 	b.mu.RUnlock()
 
-	valBelow, _ := decimal.New(int64(below), 0)
-	valN, _ := decimal.New(int64(n), 0)
-	rank, _ := valBelow.Quo(valN)
+	// midrank: (2*below + ties) / (2*n)
+	num, _ := decimal.New(int64(2*below+atBucket), 0)
+	den, _ := decimal.New(int64(2*n), 0)
+	rank, _ := num.Quo(den)
 	return rank
 }
