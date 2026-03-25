@@ -3,11 +3,11 @@ package feed
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
+
+	"obvious-profits/utils"
 
 	"github.com/bytedance/sonic"
 	"github.com/govalues/decimal"
@@ -173,7 +173,7 @@ func (c *ContractCache) Get(symbol string) (ContractInfo, bool) {
 func (c *ContractCache) Run(ctx context.Context) error {
 	slog.Info("[ContractCache] starting", "interval", c.refreshInterval)
 
-	if err := c.fetch(ctx); err != nil {
+	if err := c.fetchAndParse(ctx); err != nil {
 		slog.Error("[ContractCache] initial fetch failed", "error", err)
 	}
 
@@ -185,33 +185,18 @@ func (c *ContractCache) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := c.fetch(ctx); err != nil {
+			if err := c.fetchAndParse(ctx); err != nil {
 				slog.Error("[ContractCache] refresh failed", "error", err)
 			}
 		}
 	}
 }
 
-func (c *ContractCache) fetch(ctx context.Context) error {
+func (c *ContractCache) fetchAndParse(ctx context.Context) error {
 	url := fmt.Sprintf("%s/futures/usdt/contracts", c.apiBase)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
+	body, err := utils.HTTPGetJSON(ctx, url)
 	if err != nil {
 		return fmt.Errorf("fetch contracts: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var raw []gateContractResponse

@@ -25,7 +25,9 @@ type SymbolPair struct {
 }
 
 type BinanceConfig struct {
-	FuturesWSBase string `yaml:"futures_ws_base"`
+	FuturesWSBase             string `yaml:"futures_ws_base"`
+	FuturesAPIBase            string `yaml:"futures_api_base"`
+	FuturesDataRefreshMinutes int    `yaml:"futures_data_refresh_minutes"`
 }
 
 type GateConfig struct {

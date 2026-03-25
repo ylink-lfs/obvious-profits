@@ -6,6 +6,8 @@ symbols:
 
 binance:
   futures_ws_base: "wss://fstream.binance.com/ws"
+  futures_api_base: "https://fapi.binance.com"
+  futures_data_refresh_minutes: 30
 
 gate:
   futures_ws_base: "wss://fx-ws.gateio.ws/v4/ws/usdt"
